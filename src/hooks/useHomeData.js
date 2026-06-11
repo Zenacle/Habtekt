@@ -1,5 +1,42 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
+import { getSlabs } from '../utils/tariff'
+
+function addMonths(dateStr, months) {
+  const d = new Date(dateStr + 'T00:00:00')
+  d.setMonth(d.getMonth() + months)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const dateDay = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${dateDay}`
+}
+
+function getInitialCycleDates(currentDateStr) {
+  const now = new Date(currentDateStr + 'T00:00:00')
+  let year = now.getFullYear()
+  let month = now.getMonth()
+  
+  if (now.getDate() < 28) {
+    month -= 1
+    if (month < 0) {
+      month = 11
+      year -= 1
+    }
+  }
+  
+  if (month % 2 !== 0) {
+    month -= 1
+    if (month < 0) {
+      month = 10
+      year -= 1
+    }
+  }
+  
+  const cycleStart = `${year}-${String(month + 1).padStart(2, '0')}-28`
+  const cycleEnd = addMonths(cycleStart, 2)
+  return { cycleStart, cycleEnd }
+}
+
 
 // ── IST helpers ───────────────────────────────────────────────────────────────
 
@@ -141,7 +178,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .select('*')
           .eq('household_id', householdId)
           .lte('cycle_start', currentDateStr)
-          .gte('cycle_end', currentDateStr)
+          .gt('cycle_end', currentDateStr)
           .maybeSingle(),
 
         // Live sessions: active-day 6 AM IST → now (always fetch — daily window)
@@ -224,6 +261,91 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       if (allOpenSessionsResult.data) {
         allOpenSessionsResult.data.forEach(s => { if (!allOpenSessions[s.device_id]) allOpenSessions[s.device_id] = s })
       }
+
+      // ── Billing Cycle Rollover and Dynamic Aggregation ─────────────────────
+      let activeCycle = billingCycleResult.data
+      const isExpired = activeCycle && currentDateStr >= activeCycle.cycle_end
+
+      if (isExpired || !activeCycle) {
+        // Fetch the latest cycle overall to do rollover or find initial dates
+        const { data: latestCycle } = await supabase
+          .from('billing_cycle_summary')
+          .select('*')
+          .eq('household_id', householdId)
+          .order('cycle_end', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+
+        let currentStart, currentEnd
+        if (latestCycle) {
+          if (currentDateStr >= latestCycle.cycle_end) {
+            currentStart = latestCycle.cycle_end
+            currentEnd = addMonths(currentStart, 2)
+            while (currentDateStr >= currentEnd) {
+              currentStart = currentEnd
+              currentEnd = addMonths(currentStart, 2)
+            }
+          } else {
+            currentStart = latestCycle.cycle_start
+            currentEnd = latestCycle.cycle_end
+          }
+        } else {
+          const dates = getInitialCycleDates(currentDateStr)
+          currentStart = dates.cycleStart
+          currentEnd = dates.cycleEnd
+        }
+
+        // Only insert if it is a new/future cycle not in the database yet
+        const { data: existingCycle } = await supabase
+          .from('billing_cycle_summary')
+          .select('*')
+          .eq('household_id', householdId)
+          .eq('cycle_start', currentStart)
+          .eq('cycle_end', currentEnd)
+          .maybeSingle()
+
+        if (existingCycle) {
+          activeCycle = existingCycle
+        } else {
+          const newCycle = {
+            household_id: householdId,
+            cycle_start: currentStart,
+            cycle_end: currentEnd,
+            kwh_accumulated: 0,
+            last_reading_at: null,
+            slab_alert_threshold: 400,
+            slab_alert_sent: false,
+            cycle_locked: false,
+            source_kwh_breakdown: null
+          }
+
+          const { data: inserted, error: insertError } = await supabase
+            .from('billing_cycle_summary')
+            .insert(newCycle)
+            .select()
+            .single()
+
+          if (!insertError && inserted) {
+            activeCycle = inserted
+          } else {
+            console.error("Failed to insert new cycle:", insertError)
+            activeCycle = { ...newCycle, id: 'temp-new-cycle' }
+          }
+        }
+      }
+
+      // Fetch daily reports in the active cycle to calculate accumulated kWh dynamically
+      const cycleReportsResult = activeCycle?.cycle_start
+        ? await supabase
+            .from('daily_reports')
+            .select('*')
+            .eq('household_id', householdId)
+            .gte('report_date', activeCycle.cycle_start)
+            .lte('report_date', currentDateStr)
+        : { data: [] }
+
+      const cycleReports = cycleReportsResult.data || []
+      const kwhAccumulated = cycleReports.reduce((sum, r) => sum + parseFloat(r.total_kwh || 0), 0)
 
       // ── 7. Aggregation per view mode ──────────────────────────────────────
       let devices = []
@@ -326,18 +448,9 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
 
       // ── Billing Cycle ─────────────────────────────────────────────────────
       } else if (viewMode === 'Billing Cycle') {
-        const billingHistoryResult = billingCycleResult.data?.cycle_start
-          ? await supabase
-              .from('daily_reports')
-              .select('*')
-              .eq('household_id', householdId)
-              .gte('report_date', billingCycleResult.data.cycle_start)
-              .lte('report_date', currentDateStr)
-          : { data: [] }
-
         const billingAggregated = {}
         let bSessions = 0
-        billingHistoryResult.data?.forEach(report => {
+        cycleReports.forEach(report => {
           bSessions += parseInt(report.total_sessions || 0, 10)
           let bd = {}
           try { bd = typeof report.device_type_breakdown === 'string' ? JSON.parse(report.device_type_breakdown) : (report.device_type_breakdown || {}) } catch (e) { return }
@@ -356,7 +469,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .filter(d => d.kwh > 0.01 && d.type !== 'geyser')
           .sort((a, b) => b.kwh - a.kwh)
           .slice(0, 3)
-        displayKwh = parseFloat(billingCycleResult.data?.kwh_accumulated ?? 0)
+        displayKwh = kwhAccumulated
         totalHomeSessions = bSessions
       }
 
@@ -375,7 +488,6 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       let weather = null
       try { weather = typeof latestReport?.weather_context === 'string' ? JSON.parse(latestReport.weather_context) : (latestReport?.weather_context ?? null) } catch (e) {}
 
-      const kwhAccumulated = parseFloat(billingCycleResult.data?.kwh_accumulated ?? 0)
       const kwhEstimated   = kwhAccumulated * 1.67
 
       // Fix: est. full home is per-mode, not always billing cycle
@@ -408,7 +520,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const aboveThreshold = avg7DayKwh > 0 ? avg7DayKwh * 1.25 : 0
 
       // Billing-cycle daily average
-      const _cycleStartDate  = new Date(billingCycleResult.data?.cycle_start ?? currentDateStr)
+      const _cycleStartDate  = new Date(activeCycle?.cycle_start ?? currentDateStr)
       const _todayDateForAvg = new Date(currentDateStr)
       const _daysElapsed     = Math.max(1, Math.ceil((_todayDateForAvg - _cycleStartDate) / (1000 * 60 * 60 * 24)))
       const cycleDailyAvg    = _daysElapsed > 0 ? kwhAccumulated / _daysElapsed : 0
@@ -418,34 +530,24 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
 
       // ── 10. Slab Calculation (TNEB) ───────────────────────────────────────
       const generateSlabStatus = (measured, estimated) => {
-        const isPart2 = estimated > 500
-        const slabs = isPart2
-          ? [
-              { name: 'Slab 1', range: '0–100',   rate: 'Free',   limit: 100  },
-              { name: 'Slab 2', range: '101–400',  rate: '₹4.70', limit: 400  },
-              { name: 'Slab 3', range: '401–500',  rate: '₹6.30', limit: 500  },
-              { name: 'Slab 4', range: '501–600',  rate: '₹8.40', limit: 600  },
-              { name: 'Slab 5', range: '601–800',  rate: '₹9.45', limit: 800  },
-              { name: 'Slab 6', range: '801–1000', rate: '₹10.50',limit: 1000 },
-            ]
-          : [
-              { name: 'Slab 1', range: '0–100',   rate: 'Free',   limit: 100 },
-              { name: 'Slab 2', range: '101–200',  rate: '₹2.35', limit: 200 },
-              { name: 'Slab 3', range: '201–400',  rate: '₹4.70', limit: 400 },
-              { name: 'Slab 4', range: '401–500',  rate: '₹6.30', limit: 500 },
-            ]
+        const slabs = getSlabs(estimated)
 
-        let currentSlabIdx = slabs.findIndex(s => estimated < s.limit)
+        let currentSlabIdx = slabs.findIndex(s => estimated < s.max)
         if (currentSlabIdx === -1) currentSlabIdx = slabs.length - 1
 
         return slabs.map((s, idx) => {
-          const prevLimit = idx === 0 ? 0 : slabs[idx - 1].limit
-          const slabMeasured = Math.max(0, Math.min(measured - prevLimit, s.limit - prevLimit))
-          const fillPct = Math.round((slabMeasured / (s.limit - prevLimit)) * 100)
+          const prevLimit = idx === 0 ? 0 : slabs[idx - 1].max
+          const slabMeasured = Math.max(0, Math.min(measured - prevLimit, s.max - prevLimit))
+          const fillPct = Math.round((slabMeasured / (s.max - prevLimit)) * 100)
+          const range = s.max >= 99999 ? `${s.min - 1}+` : `${s.min}–${s.max}`
           return {
-            ...s,
+            name: `Slab ${s.num}`,
+            range,
+            rate: s.label,
+            limit: s.max,
+            color: s.color,
             active: idx === currentSlabIdx,
-            status: idx < currentSlabIdx ? 'Done ✓' : (idx === currentSlabIdx ? 'Now' : s.range),
+            status: idx < currentSlabIdx ? 'Done ✓' : (idx === currentSlabIdx ? 'Now' : range),
             fillPct
           }
         })
@@ -455,7 +557,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const currentSlab = slabStatus.find(s => s.active)
 
       // ── 11. Billing cycle display window ──────────────────────────────────
-      const cycleEndDate   = billingCycleResult.data?.cycle_end ? new Date(billingCycleResult.data.cycle_end) : null
+      const cycleEndDate   = activeCycle?.cycle_end ? new Date(activeCycle.cycle_end) : null
       const nowForCycle    = new Date()
       const cycleDisplayEnd = (cycleEndDate && nowForCycle < cycleEndDate) ? nowForCycle : cycleEndDate
       const cycleDaysLeft   = cycleEndDate
@@ -494,8 +596,8 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         billing: {
           kwh_accumulated: kwhAccumulated,
           kwh_estimated: kwhEstimated,
-          cycle_start: billingCycleResult.data?.cycle_start,
-          cycle_end: billingCycleResult.data?.cycle_end,
+          cycle_start: activeCycle?.cycle_start,
+          cycle_end: activeCycle?.cycle_end,
           cycle_display_end: cycleDisplayEnd,
           cycle_days_left: cycleDaysLeft,
           slab_status: slabStatus,

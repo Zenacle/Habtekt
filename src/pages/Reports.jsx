@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import BottomNav from '../components/BottomNav'
+import { getCurrentSlab, calculateTNEBBill } from '../utils/tariff'
 
 // --- Helpers ---
 const toISO = (d) => {
@@ -367,30 +368,49 @@ export default function Reports() {
               </div>
             )}
 
-            <div className="card-cycle">
-              <div className="cycle-hdr">
-                <h3 className="serif text-xl">Current Cycle</h3>
-                <span className="cycle-range">{selectedReport.cycle_period || 'Cycle Period'}</span>
-              </div>
-              <div className="flex justify-between items-end">
-                <div className="prog-sub" style={{ opacity: 0.7 }}>Cycle So Far</div>
-                <div className="text-sm font-bold">{parseFloat(selectedReport.cycle_measured_kwh_after || 0).toFixed(2)} units</div>
-              </div>
-              <div className="prog-bg">
-                <div className="prog-fill" style={{ width: `${Math.min(100, (parseFloat(selectedReport.cycle_measured_kwh_after || 0)/500)*100)}%` }} />
-              </div>
-              <p className="prog-sub">Proj. 11.3 units from today till Oct · 516.3 units est. end of cycle</p>
+            {(() => {
+              const estimatedUnits = parseFloat(selectedReport.cycle_estimated_after || 0)
+              const currentSlab = getCurrentSlab(estimatedUnits)
+              const estimatedBill = calculateTNEBBill(estimatedUnits)
+              const unitsLeft = currentSlab.max >= 99999 ? null : currentSlab.max - estimatedUnits
 
-              <div className="slab-box">
-                <div className="slab-tag">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M12 9v4M12 17h.01"/></svg>
-                  Slab Alert
+              return (
+                <div className="card-cycle">
+                  <div className="cycle-hdr">
+                    <h3 className="serif text-xl">Current Cycle</h3>
+                    <span className="cycle-range">{selectedReport.cycle_period || 'Cycle Period'}</span>
+                  </div>
+                  <div className="flex justify-between items-end">
+                    <div className="prog-sub" style={{ opacity: 0.7 }}>Cycle So Far</div>
+                    <div className="text-sm font-bold">{parseFloat(selectedReport.cycle_measured_kwh_after || 0).toFixed(2)} units</div>
+                  </div>
+                  <div className="prog-bg">
+                    <div className="prog-fill" style={{ width: `${Math.min(100, (parseFloat(selectedReport.cycle_measured_kwh_after || 0)/500)*100)}%` }} />
+                  </div>
+                  <p className="prog-sub">
+                    Proj. {Math.max(0, estimatedUnits - parseFloat(selectedReport.cycle_measured_kwh_after || 0)).toFixed(1)} units remaining · {estimatedUnits.toFixed(1)} units est. end of cycle
+                  </p>
+
+                  <div className="slab-box">
+                    <div className="slab-tag">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M12 9v4M12 17h.01"/></svg>
+                      Slab Alert
+                    </div>
+                    <p className="text-[13px] opacity-70" style={{ lineHeight: '1.6' }}>
+                      Current Slab: <strong>{currentSlab.rate === 0 ? 'Free' : `₹${currentSlab.rate.toFixed(2)}/unit`}</strong>
+                      {unitsLeft !== null && (
+                        <>
+                          <br />
+                          {parseFloat(unitsLeft.toFixed(2))} units remaining {currentSlab.rate === 0 ? '' : 'in current slab'}
+                        </>
+                      )}
+                      <br />
+                      Estimated Bill: <strong>₹{estimatedBill.toLocaleString()}</strong>
+                    </p>
+                  </div>
                 </div>
-                <p className="text-[13px] opacity-70">
-                  Currently in <strong>free slab</strong>. {Math.max(0, 500 - parseFloat(selectedReport.cycle_measured_kwh_after || 0)).toFixed(1)} units away from the next slab. Charges begin at ₹2.35/unit after that.
-                </p>
-              </div>
-            </div>
+              )
+            })()}
 
             <div className="card-tip">
               <div className="tip-tag serif">

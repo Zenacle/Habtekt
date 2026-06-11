@@ -5,10 +5,21 @@ import { useAuth } from '../context/AuthContext'
 import { useHomeData } from '../hooks/useHomeData'
 import EnergyGraph from '../components/EnergyGraph'
 import { supabase } from '../lib/supabase'
+import { 
+  calculateTNEBBill, 
+  getCurrentSlab, 
+  getSlabs, 
+  getDailySlabRate, 
+  SLABS_BELOW_500, 
+  SLABS_ABOVE_500,
+  calculateSubsidized,
+  calculateHighUsage,
+  calculateDailyCost
+} from '../utils/tariff'
 
 const DAYS = [
   {
-    label:'Apr 20', kwh:14.10, est:23.5, cost:'₹0', runtime:'9h 3m', costSub:'Free slab · ₹0/unit',
+    label:'Apr 20', kwh:14.10, est:23.5, cost:'₹0', runtime:'9h 3m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:543,kwh:7.80,pct:55.3,color:'var(--Am)',ico:'ac'},
       {name:'AC — Ground Floor',loc:'Living Room',mins:315,kwh:4.46,pct:31.6,color:'#1A5FB4',ico:'ac'},
@@ -19,7 +30,7 @@ const DAYS = [
     tip:{head:'AC 1st Floor used 25% more than AC Ground Floor',body:'Check if it\'s set to a lower temperature or running longer than needed. Both ACs running at 24°C and the same duration would save around 2–3 kWh per day.',kwh:'7.80',time:'9h 3m'}
   },
   {
-    label:'Apr 21', kwh:15.52, est:25.87, cost:'₹0', runtime:'16h 15m', costSub:'Free slab · ₹0/unit',
+    label:'Apr 21', kwh:15.52, est:25.87, cost:'₹0', runtime:'16h 15m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:975,kwh:7.97,pct:51.4,color:'var(--Am)',ico:'ac',carried:3.33},
       {name:'AC — Ground Floor',loc:'Living Room',mins:625,kwh:3.99,pct:25.7,color:'#1A5FB4',ico:'ac'},
@@ -29,7 +40,7 @@ const DAYS = [
     tip:{head:'AC 1st Floor ran 16h 15m — includes a session from previous night',body:'3.33 kWh carried over from a session that started the night before and ended at 2:46 AM. Cycling it off for 30 min every 2 hrs can reduce consumption by 15–20% (BEE).',kwh:'7.97',time:'16h 15m'}
   },
   {
-    label:'Apr 22', kwh:12.87, est:21.45, cost:'₹0', runtime:'13h 15m', costSub:'Free slab · ₹0/unit',
+    label:'Apr 22', kwh:12.87, est:21.45, cost:'₹0', runtime:'13h 15m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:795,kwh:8.06,pct:62.6,color:'var(--Am)',ico:'ac'},
       {name:'AC — Ground Floor',loc:'Living Room',mins:615,kwh:4.72,pct:36.7,color:'#1A5FB4',ico:'ac'},
@@ -39,7 +50,7 @@ const DAYS = [
     tip:{head:'AC 1st Floor ran 13h 15m on a cool night (25.8°C min)',body:'On cooler nights the AC needs less time. Try raising the set temperature slightly — BEE: every 1°C increase saves ~6% electricity.',kwh:'8.06',time:'13h 15m'}
   },
   {
-    label:'Apr 23', kwh:13.87, est:23.12, cost:'₹0', runtime:'15h 50m', costSub:'Free slab · ₹0/unit',
+    label:'Apr 23', kwh:13.87, est:23.12, cost:'₹0', runtime:'15h 50m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:950,kwh:8.23,pct:59.3,color:'var(--Am)',ico:'ac'},
       {name:'AC — Ground Floor',loc:'Living Room',mins:705,kwh:5.40,pct:38.9,color:'#1A5FB4',ico:'ac'},
@@ -49,7 +60,7 @@ const DAYS = [
     tip:{head:'AC 1st Floor ran 15h 50m — cool night (25.7°C min)',body:'On cooler nights the AC needs less time. Try raising the set temperature slightly. BEE: every 1°C increase saves ~6% electricity.',kwh:'8.23',time:'15h 50m'}
   },
   {
-    label:'Apr 24', kwh:17.20, est:28.67, cost:'₹21', runtime:'15h 58m', costSub:'Slab 2 begins · ₹2.35/unit',
+    label:'Apr 24', kwh:17.20, est:28.67, cost:'₹0', runtime:'15h 58m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:958,kwh:11.31,pct:65.8,color:'var(--Am)',ico:'ac'},
       {name:'AC — Ground Floor',loc:'Living Room',mins:555,kwh:5.59,pct:32.5,color:'#1A5FB4',ico:'ac'},
@@ -59,7 +70,7 @@ const DAYS = [
     tip:{head:'AC 1st Floor ran nearly 16 hours last night',body:'Cycling it off for 30 minutes every 2 hours can reduce consumption by 15–20% (BEE). You can set this schedule in the Habtekt app once scheduling is live.',kwh:'11.31',time:'15h 58m'}
   },
   {
-    label:'Apr 25', kwh:18.22, est:30.37, cost:'₹45', runtime:'14h 10m', costSub:'Slab 2 · ₹2.35/unit',
+    label:'Apr 25', kwh:18.22, est:30.37, cost:'₹0', runtime:'14h 10m', costSub:'Free',
     devices:[
       {name:'AC — 1st Floor',loc:'Bedroom',mins:850,kwh:10.09,pct:55.4,color:'var(--Am)',ico:'ac'},
       {name:'AC — Ground Floor',loc:'Living Room',mins:780,kwh:7.71,pct:42.3,color:'#1A5FB4',ico:'ac'},
@@ -95,72 +106,6 @@ function fmt(mins) {
   return h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : (`${m}m`)
 }
 
-// ── TNEB Slab data (aligned with Home page) ──────────────────────────────────
-const SLABS_BELOW_500 = [
-  { num: 1, min: 1,   max: 100, rate: 0,    color: '#1D9E75', label: 'Free'   },
-  { num: 2, min: 101, max: 200, rate: 2.35, color: '#EF9F27', label: '₹2.35' },
-  { num: 3, min: 201, max: 400, rate: 4.70, color: '#E24B4A', label: '₹4.70' },
-  { num: 4, min: 401, max: 500, rate: 6.30, color: '#534AB7', label: '₹6.30' },
-]
-
-const SLABS_ABOVE_500 = [
-  { num: 1, min: 1,    max: 100,   rate: 0,     color: '#1D9E75', label: 'Free'    },
-  { num: 2, min: 101,  max: 400,   rate: 4.70,  color: '#EF9F27', label: '₹4.70'  },
-  { num: 3, min: 401,  max: 500,   rate: 6.30,  color: '#E24B4A', label: '₹6.30'  },
-  { num: 4, min: 501,  max: 600,   rate: 8.40,  color: '#534AB7', label: '₹8.40'  },
-  { num: 5, min: 601,  max: 800,   rate: 9.45,  color: '#185FA5', label: '₹9.45'  },
-  { num: 6, min: 801,  max: 1000,  rate: 10.50, color: '#0F6E56', label: '₹10.50' },
-  { num: 7, min: 1001, max: 99999, rate: 11.55, color: '#993C1D', label: '₹11.55' },
-]
-
-function getSlabs(units) { return units <= 500 ? SLABS_BELOW_500 : SLABS_ABOVE_500 }
-
-function calculateTNEBBill(units) {
-  if (!units || units <= 0) return 0
-  const slabs = getSlabs(units)
-  let total = 0
-  for (const slab of slabs) {
-    if (units < slab.min) break
-    const inSlab = Math.min(units, slab.max) - slab.min + 1
-    total += inSlab * slab.rate
-  }
-  return Math.round(total)
-}
-
-function calculateSubsidized(units) {
-  if (!units || units <= 0) return 0
-  let total = 0
-  for (const slab of SLABS_BELOW_500) {
-    if (units < slab.min) break
-    const inSlab = Math.min(units, slab.max) - slab.min + 1
-    total += inSlab * slab.rate
-  }
-  return Math.round(total)
-}
-
-function calculateHighUsage(units) {
-  if (!units || units <= 0) return 0
-  let total = 0
-  for (const slab of SLABS_ABOVE_500) {
-    if (units < slab.min) break
-    const inSlab = Math.min(units, slab.max) - slab.min + 1
-    total += inSlab * slab.rate
-  }
-  return Math.round(total)
-}
-
-function calculateDailyCost(units) {
-  if (units <= 500) {
-    return calculateSubsidized(units)
-  } else {
-    return calculateHighUsage(units)
-  }
-}
-
-function getCurrentSlab(units) {
-  const slabs = getSlabs(units)
-  return slabs.find(s => units >= s.min && units <= s.max) ?? slabs[slabs.length - 1]
-}
 
 function EnergyHeader({ cycleDay, startDate, endDate, slabRate, slabName }) {
   return (
@@ -254,17 +199,10 @@ export default function Energy() {
 
   // ── Fix: isolated daily cost calculation ──────────────────────────────────────────
   // Use the selected date's estimated full home kWh to determine the slab.
-  function getDailySlabRate(units) {
-    if (units <= 100) return { slab: 1, rate: 2.35 }
-    if (units <= 200) return { slab: 2, rate: 2.35 }
-    if (units <= 400) return { slab: 3, rate: 4.7 }
-    if (units <= 500) return { slab: 4, rate: 6.3 }
-    return { slab: 5, rate: 8.4 }
-  }
 
   const _dailySlabInfo = getDailySlabRate(dailyEstimatedFullHome)
   const dailyEstimatedCost = Math.round(dailyEstimatedFullHome * _dailySlabInfo.rate)
-  const dailyCostSub = `Slab ${_dailySlabInfo.slab} · ₹${_dailySlabInfo.rate}/unit`
+  const dailyCostSub = _dailySlabInfo.rate === 0 ? 'Free' : `Slab ${_dailySlabInfo.slab} · ₹${_dailySlabInfo.rate}/unit`
 
   const dailyReportBreakdown = useMemo(() => {
     let breakdown = {}
@@ -459,7 +397,7 @@ export default function Energy() {
     cost: viewMode === 'Daily' ? `₹${dailyEstimatedCost.toLocaleString()}` : `₹${calculatedCost.toLocaleString()}`,
     runtime: viewMode === 'Daily' ? (topDevice ? fmt(topDevice.minutes) : '—') : mockD.runtime,
     costSub: viewMode === 'Daily' ? dailyCostSub : (viewMode === 'Weekly' ? weeklyCostSub : (activeSlab.rate === 0
-      ? `Free slab · ₹0/unit`
+      ? 'Free'
       : `Slab ${activeSlab.num} · ₹${activeSlab.rate}/unit`)),
     devices: viewMode === 'Daily' ? dailyDevicesMapped : (data?.today?.devices ?? []).map((dev, i) => ({
       name: dev.name,

@@ -4,6 +4,14 @@ import { useAuth } from '../context/AuthContext'
 import { useHomeData } from '../hooks/useHomeData'
 import BottomNav from '../components/BottomNav'
 import EnergyGraph from '../components/EnergyGraph'
+import { 
+  calculateTNEBBill, 
+  getCurrentSlab, 
+  getSlabs, 
+  getDailySlabRate, 
+  SLABS_BELOW_500, 
+  SLABS_ABOVE_500 
+} from '../utils/tariff'
 
 function fmt(mins) {
   if (!mins) return '—'
@@ -210,14 +218,6 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
         </div>
         {(() => {
           // ── Fix: isolated daily cost calculation ──────────────────────────────────────────
-          function getDailySlabRate(units) {
-            if (units <= 100) return { slab: 1, rate: 2.35 }
-            if (units <= 200) return { slab: 2, rate: 2.35 }
-            if (units <= 400) return { slab: 3, rate: 4.7 }
-            if (units <= 500) return { slab: 4, rate: 6.3 }
-            return { slab: 5, rate: 8.4 }
-          }
-
           const cycleAccumulated = parseFloat(billing?.kwh_accumulated ?? 0)
           const estKwh           = parseFloat(today?.estimated_full_home_kwh ?? 0)
           const cycleEstimated   = parseFloat(billing?.kwh_estimated ?? 0)
@@ -236,30 +236,18 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
                 const measured = parseFloat(report.total_kwh || 0)
                 const coverage = parseFloat(report.coverage_ratio || 1)
                 const estimated = coverage > 0 ? measured / coverage : measured
-                const slabInfo = getDailySlabRate(estimated)
-                weeklyEst += estimated * slabInfo.rate
+                weeklyEst += estimated * currentRate
               })
             }
             // Add today if not in history yet
             const activeDateStr = today?.report_date
             const lastHistoryDate = history?.[history.length - 1]?.report_date
             if (lastHistoryDate !== activeDateStr) {
-              const todaySlab = getDailySlabRate(estKwh)
-              weeklyEst += estKwh * todaySlab.rate
+              weeklyEst += estKwh * currentRate
             }
             displayCost = Math.round(weeklyEst)
-            
-            // For weekly display, use today's rate as fallback for the subtitle
-            const todaySlabInfo = getDailySlabRate(estKwh)
-            activeSlab = { num: todaySlabInfo.slab }
-            currentRate = todaySlabInfo.rate
-            isFree = currentRate === 0
           } else {
-            const todaySlabInfo = getDailySlabRate(estKwh)
-            displayCost = Math.round(estKwh * todaySlabInfo.rate)
-            activeSlab = { num: todaySlabInfo.slab }
-            currentRate = todaySlabInfo.rate
-            isFree = currentRate === 0
+            displayCost = Math.round(estKwh * currentRate)
           }
 
           if (estKwh <= 0 && viewMode !== 'Billing Cycle') return null
@@ -286,42 +274,6 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
   )
 }
 
-// ── TNEB Slab data ────────────────────────────────────────────────────────────
-const SLABS_BELOW_500 = [
-  { num: 1, min: 1,   max: 100, rate: 0,    color: '#1D9E75', label: 'Free'   },
-  { num: 2, min: 101, max: 200, rate: 2.35, color: '#EF9F27', label: '₹2.35' },
-  { num: 3, min: 201, max: 400, rate: 4.70, color: '#E24B4A', label: '₹4.70' },
-  { num: 4, min: 401, max: 500, rate: 6.30, color: '#534AB7', label: '₹6.30' },
-]
-
-const SLABS_ABOVE_500 = [
-  { num: 1, min: 1,    max: 100,   rate: 0,     color: '#1D9E75', label: 'Free'    },
-  { num: 2, min: 101,  max: 400,   rate: 4.70,  color: '#EF9F27', label: '₹4.70'  },
-  { num: 3, min: 401,  max: 500,   rate: 6.30,  color: '#E24B4A', label: '₹6.30'  },
-  { num: 4, min: 501,  max: 600,   rate: 8.40,  color: '#534AB7', label: '₹8.40'  },
-  { num: 5, min: 601,  max: 800,   rate: 9.45,  color: '#185FA5', label: '₹9.45'  },
-  { num: 6, min: 801,  max: 1000,  rate: 10.50, color: '#0F6E56', label: '₹10.50' },
-  { num: 7, min: 1001, max: 99999, rate: 11.55, color: '#993C1D', label: '₹11.55' },
-]
-
-function getSlabs(units) { return units <= 500 ? SLABS_BELOW_500 : SLABS_ABOVE_500 }
-
-function calculateTNEBBill(units) {
-  if (!units || units <= 0) return 0
-  const slabs = getSlabs(units)
-  let total = 0
-  for (const slab of slabs) {
-    if (units < slab.min) break
-    const inSlab = Math.min(units, slab.max) - slab.min + 1
-    total += inSlab * slab.rate
-  }
-  return Math.round(total)
-}
-
-function getCurrentSlab(units) {
-  const slabs = getSlabs(units)
-  return slabs.find(s => units >= s.min && units <= s.max) ?? slabs[slabs.length - 1]
-}
 
 // ── BillingCard ───────────────────────────────────────────────────────────────
 function BillingCard({ billing, report }) {
