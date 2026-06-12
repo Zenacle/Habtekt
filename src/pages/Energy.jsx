@@ -185,23 +185,26 @@ export default function Energy() {
   const historyReport = data?.history?.find(h => h.report_date === selectedDateStr)
   const activeDailyReport = historyReport || dailyReport
 
-  const dailyMeasuredKwh = isLiveDate
-    ? parseFloat(data?.today?.total_kwh || 0)
-    : parseFloat(activeDailyReport?.total_kwh || 0)
+  const dailyCostObj = data?.dailyCosts?.find(d => d.report_date === selectedDateStr)
+
+  const dailyMeasuredKwh = dailyCostObj
+    ? dailyCostObj.measured_kwh
+    : (isLiveDate
+        ? parseFloat(data?.today?.total_kwh || 0)
+        : parseFloat(activeDailyReport?.total_kwh || 0))
 
   const dailyCoverage = isLiveDate
     ? 0.6
     : parseFloat(activeDailyReport?.coverage_ratio || 1)
 
-  const dailyEstimatedFullHome = isLiveDate
-    ? parseFloat(data?.today?.estimated_full_home_kwh || 0)
-    : (dailyCoverage > 0 ? dailyMeasuredKwh / dailyCoverage : dailyMeasuredKwh)
+  const dailyEstimatedFullHome = dailyCostObj
+    ? dailyCostObj.estimated_kwh
+    : (isLiveDate
+        ? parseFloat(data?.today?.estimated_full_home_kwh || 0)
+        : (dailyCoverage > 0 ? dailyMeasuredKwh / dailyCoverage : dailyMeasuredKwh))
 
-  // ── Fix: isolated daily cost calculation ──────────────────────────────────────────
-  // Use the selected date's estimated full home kWh to determine the slab.
-
+  const dailyEstimatedCost = dailyCostObj ? Math.round(dailyCostObj.daily_cost) : 0
   const _dailySlabInfo = getDailySlabRate(dailyEstimatedFullHome)
-  const dailyEstimatedCost = Math.round(dailyEstimatedFullHome * _dailySlabInfo.rate)
   const dailyCostSub = _dailySlabInfo.rate === 0 ? 'Free' : `Slab ${_dailySlabInfo.slab} · ₹${_dailySlabInfo.rate}/unit`
 
   const dailyReportBreakdown = useMemo(() => {
@@ -245,9 +248,10 @@ export default function Energy() {
   }, [dailyReportBreakdown])
 
   const topDevice = useMemo(() => {
+    if (dailyMeasuredKwh === 0 && dailyEstimatedFullHome === 0) return null
     if (!dailyDevices || dailyDevices.length === 0) return null
     return [...dailyDevices].sort((a, b) => b.kwh - a.kwh)[0]
-  }, [dailyDevices])
+  }, [dailyDevices, dailyMeasuredKwh, dailyEstimatedFullHome])
 
   const dailyDevicesMapped = useMemo(() => {
     return dailyDevices.map((dev, i) => ({
@@ -360,32 +364,13 @@ export default function Energy() {
   const currentRate = activeSlab.rate
 
   let calculatedCost = 0
-  let weeklyCostSub = ''
+  let weeklyCostSub = 'Sum of daily costs'
   if (viewMode === 'Billing Cycle') {
-    calculatedCost = calculateTNEBBill(cycleAccumulated)
+    calculatedCost = Math.round(billing?.billing_cycle_cost ?? 0)
   } else if (viewMode === 'Weekly') {
-    let weeklyEst = 0
-    // Sum historical days
-    if (data?.history) {
-      data.history.forEach(report => {
-        const measured = parseFloat(report.total_kwh || 0)
-        const coverage = parseFloat(report.coverage_ratio || 1)
-        const estimated = coverage > 0 ? measured / coverage : measured
-        const slabInfo = getDailySlabRate(estimated)
-        weeklyEst += estimated * slabInfo.rate
-      })
-    }
-    // Check if today is already in history, if not add it
-    const lastHistoryDate = data?.history?.[data.history.length - 1]?.report_date
-    if (lastHistoryDate !== activeDateStr && viewMode === 'Weekly') {
-      const todayEst = parseFloat(data?.today?.estimated_full_home_kwh ?? 0)
-      const todaySlab = getDailySlabRate(todayEst)
-      weeklyEst += todayEst * todaySlab.rate
-    }
-    calculatedCost = Math.round(weeklyEst)
-    weeklyCostSub = 'Sum of daily costs'
+    calculatedCost = Math.round(data?.today?.weekly_cost ?? 0)
   } else {
-    calculatedCost = Math.round(estKwh * currentRate)
+    calculatedCost = Math.round(data?.today?.daily_cost ?? 0)
   }
 
   const mockD = DAYS[5]
@@ -674,7 +659,7 @@ export default function Energy() {
         <div className="e-metric">
           <div className="e-m-lbl">TOP DEVICE</div>
           <div className="e-m-val" style={{ fontSize: 14, fontWeight: 500, marginTop: 1, color: 'var(--tx)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {viewMode === 'Daily' ? (topDevice ? topDevice.name : '—') : 'AC - 1st Floor'}
+            {viewMode === 'Daily' ? (topDevice ? topDevice.name : 'No device usage') : 'AC - 1st Floor'}
           </div>
           <div className="e-m-sub" style={{ color: 'var(--tx2)', fontSize: 11, marginTop: 2, display: 'flex', flexDirection: 'column' }}>
             {viewMode === 'Daily' ? (
@@ -683,7 +668,7 @@ export default function Energy() {
                   <span>{fmt(topDevice.minutes)}</span>
                   <span>{parseFloat(topDevice.kwh).toFixed(2)} kWh</span>
                 </>
-              ) : '—'
+              ) : 'No device usage'
             ) : (
               <>
                 <span>14h 10m</span>
@@ -786,7 +771,7 @@ export default function Energy() {
 
           const isAbove500    = estimatedUnits > 500
           const currentSlab   = getCurrentSlab(estimatedUnits)
-          const estimatedBill = calculateTNEBBill(estimatedUnits)
+          const estimatedBill = Math.round(billing?.billing_cycle_cost ?? calculateTNEBBill(estimatedUnits))
           const unitsLeftInSlab = currentSlab.max >= 99999
             ? null
             : Math.max(0, currentSlab.max - estimatedUnits)

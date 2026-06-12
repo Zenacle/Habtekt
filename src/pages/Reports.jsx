@@ -12,6 +12,41 @@ const toISO = (d) => {
   return `${y}-${m}-${day}`
 }
 
+function addMonths(dateStr, months) {
+  const d = new Date(dateStr + 'T00:00:00')
+  d.setMonth(d.getMonth() + months)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const dateDay = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${dateDay}`
+}
+
+function getInitialCycleDates(currentDateStr) {
+  const now = new Date(currentDateStr + 'T00:00:00')
+  let year = now.getFullYear()
+  let month = now.getMonth()
+  
+  if (now.getDate() < 28) {
+    month -= 1
+    if (month < 0) {
+      month = 11
+      year -= 1
+    }
+  }
+  
+  if (month % 2 !== 0) {
+    month -= 1
+    if (month < 0) {
+      month = 10
+      year -= 1
+    }
+  }
+  
+  const cycleStart = `${year}-${String(month + 1).padStart(2, '0')}-28`
+  const cycleEnd = addMonths(cycleStart, 2)
+  return { cycleStart, cycleEnd }
+}
+
 const fmtDate = (iso) => {
   if (!iso) return ''
   const [y, m, d] = iso.split('-')
@@ -114,13 +149,119 @@ export default function Reports() {
     if (!selectedDate || !householdId) return
     const fetchReport = async () => {
       setReportLoading(true)
-      const { data } = await supabase
+      const { data: reportData } = await supabase
         .from('daily_reports')
         .select('*')
         .eq('household_id', householdId)
         .eq('report_date', selectedDate)
         .maybeSingle()
-      setSelectedReport(data)
+
+      if (reportData) {
+        // Get cycle start date
+        const { cycleStart } = getInitialCycleDates(selectedDate)
+        
+        // Fetch all reports in this cycle up to selectedDate
+        const { data: cycleReports } = await supabase
+          .from('daily_reports')
+          .select('report_date, total_kwh, coverage_ratio')
+          .eq('household_id', householdId)
+          .gte('report_date', cycleStart)
+          .lte('report_date', selectedDate)
+          .order('report_date', { ascending: true })
+
+        // Fetch all sessions in this cycle up to selectedDate
+        const cycleStartIST = `${cycleStart}T00:30:00Z`
+        const selectedDateEndIST = `${selectedDate}T23:59:59+05:30`
+        const { data: cycleReadings } = await supabase
+          .from('appliance_readings')
+          .select('*')
+          .eq('household_id', householdId)
+          .gte('session_start', cycleStartIST)
+          .lte('session_start', new Date(selectedDateEndIST).toISOString())
+
+        const getActiveISTDateStr = (isoStr) => {
+          const d = new Date(isoStr)
+          const istDate = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
+          if (istDate.getHours() < 6) {
+            istDate.setDate(istDate.getDate() - 1)
+          }
+          const y = istDate.getFullYear()
+          const m = String(istDate.getMonth() + 1).padStart(2, '0')
+          const day = String(istDate.getDate()).padStart(2, '0')
+          return `${y}-${m}-${day}`
+        }
+
+        const getDatesInRange = (startStr, endStr) => {
+          const dates = []
+          const start = new Date(startStr + 'T00:00:00')
+          const end = new Date(endStr + 'T00:00:00')
+          const current = new Date(start)
+          while (current <= end) {
+            const y = current.getFullYear()
+            const m = String(current.getMonth() + 1).padStart(2, '0')
+            const day = String(current.getDate()).padStart(2, '0')
+            dates.push(`${y}-${m}-${day}`)
+            current.setDate(current.getDate() + 1)
+          }
+          return dates
+        }
+
+        const cycleDates = getDatesInRange(cycleStart, selectedDate)
+        let cumulativeEstimated = 0
+        let selectedDayCost = 0
+        let sumDailyCosts = 0
+        let selectedDayMeasured = 0
+        let selectedDayEstimated = 0
+        let cycleMeasuredSum = 0
+        
+        cycleDates.forEach(dateStr => {
+          const daySessions = (cycleReadings || []).filter(s => getActiveISTDateStr(s.session_start) === dateStr)
+          const report = (cycleReports || []).find(r => r.report_date === dateStr)
+          const isToday = dateStr === getActiveISTDateStr(new Date().toISOString())
+          
+          let measured = daySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
+          const coverage = parseFloat(report?.coverage_ratio || 0.6)
+          let estimated = coverage > 0 ? measured / coverage : measured
+
+          if (!isToday && report) {
+            if (report.daily_measured_kwh !== null && report.daily_measured_kwh !== undefined) {
+              measured = parseFloat(report.daily_measured_kwh)
+            }
+            if (report.daily_estimated_kwh !== null && report.daily_estimated_kwh !== undefined) {
+              estimated = parseFloat(report.daily_estimated_kwh)
+            }
+          }
+
+          const prevCumulative = cumulativeEstimated
+          cumulativeEstimated += estimated
+          
+          let cost = calculateTNEBBill(cumulativeEstimated) - calculateTNEBBill(prevCumulative)
+          if (!isToday && report && report.daily_cost !== null && report.daily_cost !== undefined) {
+            cost = parseFloat(report.daily_cost)
+          }
+
+          sumDailyCosts += cost
+          cycleMeasuredSum += measured
+
+          if (dateStr === selectedDate) {
+            selectedDayCost = cost
+            selectedDayMeasured = measured
+            selectedDayEstimated = estimated
+          }
+        })
+        
+        setSelectedReport({
+          ...reportData,
+          total_kwh: selectedDayMeasured,
+          estimated_full_home_kwh: selectedDayEstimated,
+          cycle_measured_kwh_after: cycleMeasuredSum,
+          cycle_estimated_after: cumulativeEstimated,
+          computed_daily_cost: selectedDayCost,
+          computed_cycle_cost: sumDailyCosts
+        })
+      } else {
+        setSelectedReport(null)
+      }
       setReportLoading(false)
     }
     fetchReport()
@@ -334,9 +475,15 @@ export default function Reports() {
                 try { breakdown = typeof selectedReport.device_type_breakdown === 'string' ? JSON.parse(selectedReport.device_type_breakdown) : (selectedReport.device_type_breakdown || {}) } catch(e) {}
                 const devs = breakdown.today || breakdown.by_device || breakdown.by_type || {}
                 
+                const totalDevKwh = Object.values(devs).reduce((sum, d) => sum + parseFloat(d.kwh || 0), 0)
+                const dailyCost = selectedReport.computed_daily_cost ?? 0
+
                 return Object.entries(devs).map(([id, d], idx) => {
                   const colors = ['#1F3E32', '#F5C518', '#1A5FB4']
                   const icoColor = colors[idx % colors.length]
+                  const devMeasured = parseFloat(d.kwh || 0)
+                  const devCost = totalDevKwh > 0 ? (devMeasured / totalDevKwh) * dailyCost : (d.cost || 0)
+
                   return (
                     <div key={idx} className="device-item">
                       <div className="device-ico" style={{ background: icoColor }}>
@@ -351,8 +498,8 @@ export default function Reports() {
                         <div className="device-meta">{fmtTime(d.minutes)}</div>
                       </div>
                       <div className="device-stats">
-                        <div className="device-units">{parseFloat(d.kwh || 0).toFixed(2)} units</div>
-                        <div className="device-cost">₹{Math.round(d.cost || 0)}</div>
+                        <div className="device-units">{devMeasured.toFixed(2)} units</div>
+                        <div className="device-cost">₹{Math.round(devCost)}</div>
                       </div>
                     </div>
                   )
@@ -371,7 +518,7 @@ export default function Reports() {
             {(() => {
               const estimatedUnits = parseFloat(selectedReport.cycle_estimated_after || 0)
               const currentSlab = getCurrentSlab(estimatedUnits)
-              const estimatedBill = calculateTNEBBill(estimatedUnits)
+              const estimatedBill = Math.round(selectedReport.computed_cycle_cost ?? calculateTNEBBill(estimatedUnits))
               const unitsLeft = currentSlab.max >= 99999 ? null : currentSlab.max - estimatedUnits
 
               return (

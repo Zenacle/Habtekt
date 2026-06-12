@@ -167,25 +167,43 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
 
       <div className="space-y-2.5">
         {devices.length === 0 ? (
-          <p className="text-xs text-tx-3 py-2">No sessions recorded yet today</p>
+          <div className="flex flex-col items-center justify-center py-5 px-4 bg-[#F0EDE7]/30 rounded-2xl border border-black/5 text-center my-1">
+            <div className="w-8 h-8 rounded-full bg-[#FEF3DC] flex items-center justify-center mb-2">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#D4880A" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+              </svg>
+            </div>
+            <p className="text-xs font-semibold text-tx mb-0.5">No energy usage recorded today</p>
+            <p className="text-[11px] text-tx-3">No appliances have reported activity since 6 AM.</p>
+          </div>
         ) : (
-          devices.slice(0, 3).map((dev, i) => {
-            const barW = Math.round((dev.kwh / maxKwh) * 100)
-            return (
-              <div key={dev.device_id}>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs font-medium text-tx">{dev.name}</span>
-                  <span className="text-xs text-tx-2">{dev.kwh.toFixed(2)} kWh</span>
-                </div>
-                <div className="h-1.5 bg-surface-2 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full transition-all duration-500"
-                    style={{ width: `${barW}%`, backgroundColor: devColors[i] }}
-                  />
-                </div>
+          <>
+            {(devices.length > 3 || today?.hasMoreDevices) && (
+              <div className="mb-2.5">
+                <p className="text-[10px] font-medium text-tx-3 text-left mb-1.5">
+                  Showing top 3 active devices
+                </p>
+                <div className="border-t border-black/5" />
               </div>
-            )
-          })
+            )}
+            {devices.slice(0, 3).map((dev, i) => {
+              const barW = Math.round((dev.kwh / maxKwh) * 100)
+              return (
+                <div key={dev.device_id}>
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="text-xs font-medium text-tx">{dev.name}</span>
+                    <span className="text-xs text-tx-2">{dev.kwh.toFixed(2)} kWh</span>
+                  </div>
+                  <div className="h-1.5 bg-surface-2 rounded-full overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-500"
+                      style={{ width: `${barW}%`, backgroundColor: devColors[i] }}
+                    />
+                  </div>
+                </div>
+              )
+            })}
+          </>
         )}
         {devices.length > 0 && (
           <Link 
@@ -203,24 +221,25 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
             {note}
           </p>
         )}
-        <div className="flex justify-between items-center pt-1 border-t border-black/5">
-          <span className="text-xs text-tx-3">
-            {(() => {
-              const activeSessions = today?.open_sessions || []
-              if (activeSessions.length === 0) return 'No sessions right now'
-              if (activeSessions.length > 1) return `${activeSessions.length} devices currently running`
-              return `${activeSessions[0].name} is still running`
-            })()}
-          </span>
-          <Link to="/appliances" className="text-xs font-medium text-tx-2 hover:underline underline-offset-2 cursor-pointer">
-            {today?.session_count || 0} sessions {viewMode === 'Daily' ? 'today' : viewMode === 'Weekly' ? 'this week' : 'this cycle'}
-          </Link>
-        </div>
+        {devices.length > 0 && (
+          <div className="flex justify-between items-center pt-1 border-t border-black/5">
+            <span className="text-xs text-tx-3">
+              {(() => {
+                const activeSessions = today?.open_sessions || []
+                if (activeSessions.length === 0) return 'No sessions right now'
+                if (activeSessions.length > 1) return `${activeSessions.length} devices currently running`
+                return `${activeSessions[0].name} is still running`
+              })()}
+            </span>
+            <Link to="/appliances" className="text-xs font-medium text-tx-2 hover:underline underline-offset-2 cursor-pointer">
+              {today?.session_count || 0} sessions {viewMode === 'Daily' ? 'today' : viewMode === 'Weekly' ? 'this week' : 'this cycle'}
+            </Link>
+          </div>
+        )}
         {(() => {
-          // ── Fix: isolated daily cost calculation ──────────────────────────────────────────
-          const cycleAccumulated = parseFloat(billing?.kwh_accumulated ?? 0)
-          const estKwh           = parseFloat(today?.estimated_full_home_kwh ?? 0)
+          // ── Analytics Cost Model ──────────────────────────────────────────
           const cycleEstimated   = parseFloat(billing?.kwh_estimated ?? 0)
+          const estKwh           = parseFloat(today?.estimated_full_home_kwh ?? 0)
 
           let displayCost = 0
           let activeSlab = getCurrentSlab(cycleEstimated) // fallback for cycle
@@ -228,29 +247,14 @@ function EnergyCard({ today, viewMode, toggleViewMode, weekWindow, billing, hist
           let isFree = currentRate === 0
 
           if (viewMode === 'Billing Cycle') {
-            displayCost = calculateTNEBBill(cycleAccumulated)
+            displayCost = Math.round(billing?.billing_cycle_cost ?? 0)
           } else if (viewMode === 'Weekly') {
-            let weeklyEst = 0
-            if (history) {
-              history.forEach(report => {
-                const measured = parseFloat(report.total_kwh || 0)
-                const coverage = parseFloat(report.coverage_ratio || 1)
-                const estimated = coverage > 0 ? measured / coverage : measured
-                weeklyEst += estimated * currentRate
-              })
-            }
-            // Add today if not in history yet
-            const activeDateStr = today?.report_date
-            const lastHistoryDate = history?.[history.length - 1]?.report_date
-            if (lastHistoryDate !== activeDateStr) {
-              weeklyEst += estKwh * currentRate
-            }
-            displayCost = Math.round(weeklyEst)
+            displayCost = Math.round(today?.weekly_cost ?? 0)
           } else {
-            displayCost = Math.round(estKwh * currentRate)
+            displayCost = Math.round(today?.daily_cost ?? 0)
           }
 
-          if (estKwh <= 0 && viewMode !== 'Billing Cycle') return null
+          if (estKwh < 0) return null
 
           return (
             <div className="flex justify-between items-center mt-2 pt-2 border-t border-black/5">
@@ -289,7 +293,7 @@ function BillingCard({ billing, report }) {
 
   const isAbove500    = estimatedUnits > 500
   const currentSlab   = getCurrentSlab(estimatedUnits)
-  const estimatedBill = calculateTNEBBill(estimatedUnits)
+  const estimatedBill = Math.round(billing?.billing_cycle_cost ?? calculateTNEBBill(estimatedUnits))
   const unitsLeftInSlab = currentSlab.max >= 99999
     ? null
     : Math.max(0, currentSlab.max - estimatedUnits)
