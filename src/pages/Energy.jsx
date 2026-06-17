@@ -107,7 +107,8 @@ function fmt(mins) {
 }
 
 
-function EnergyHeader({ cycleDay, startDate, endDate, slabRate, slabName }) {
+function EnergyHeader({ cycleDay, startDate, endDate, slabName, cost }) {
+  const displayCostStr = cost === 0 ? '₹0 today' : `₹${Math.round(cost).toLocaleString()}`
   return (
     <div className="energy-header">
       <div className="left">
@@ -119,7 +120,7 @@ function EnergyHeader({ cycleDay, startDate, endDate, slabRate, slabName }) {
 
       <div className="right">
         <span className="slab-badge">
-          {slabName} · ₹{slabRate}/unit
+          {slabName} · {displayCostStr}
         </span>
       </div>
     </div>
@@ -220,7 +221,7 @@ export default function Energy() {
   }, [activeDailyReport])
 
   const dailyDevices = useMemo(() => {
-    if (isLiveDate && data?.today?.devices) {
+    if (data?.today?.devices) {
       return data.today.devices.map(d => ({
         name: d.name,
         kwh: parseFloat(d.kwh || 0),
@@ -245,7 +246,7 @@ export default function Energy() {
       sessions: parseInt(val.sessions || 0, 10),
       ...val
     }))
-  }, [dailyReportBreakdown])
+  }, [dailyReportBreakdown, data?.today?.devices])
 
   const topDevice = useMemo(() => {
     if (dailyMeasuredKwh === 0 && dailyEstimatedFullHome === 0) return null
@@ -413,6 +414,16 @@ export default function Energy() {
       kwh: '', time: ''
     }
   }
+
+  console.log('CARD DATA', d)
+  console.log('MEASURED CARD VALUE', d.kwh)
+  console.log('VIEW MODE', viewMode)
+  console.log('METRIC CARD OBJECT', {
+    kwh: d.kwh,
+    estimated: d.est,
+    cost: d.cost,
+    viewMode
+  })
     
   const startFmt = cycleStart ? cycleStart.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: new Date().getFullYear() !== cycleStart.getFullYear() ? 'numeric' : undefined }) : '—'
   const endFmt = cycleEnd ? cycleEnd.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: new Date().getFullYear() !== cycleEnd.getFullYear() ? 'numeric' : undefined }) : '—'
@@ -420,6 +431,29 @@ export default function Energy() {
   const daysLeft = cycleEnd 
     ? Math.max(0, Math.ceil((cycleEnd - currentTime) / (1000 * 60 * 60 * 24)))
     : '—'
+
+  const dDate = new Date(selectedDateStr + 'T00:00:00')
+  const dayOfWeek = dDate.getDay()
+  const diffOfWeek = (dayOfWeek === 0 ? -6 : 1) - dayOfWeek
+  const mondayOfWeek = new Date(dDate)
+  mondayOfWeek.setDate(dDate.getDate() + diffOfWeek)
+  const mondayStr = mondayOfWeek.toISOString().split('T')[0]
+  const sundayOfWeek = new Date(mondayOfWeek)
+  sundayOfWeek.setDate(mondayOfWeek.getDate() + 6)
+  const sundayStr = sundayOfWeek.toISOString().split('T')[0]
+
+  const weeklyMeasuredFromSnapshots = (data?.dailyCosts || [])
+    .filter(s => s.report_date >= mondayStr && s.report_date <= sundayStr)
+    .reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0)
+
+  const weeklyMeasuredFromDevices = (data?.today?.devices || [])
+    .reduce((sum, dev) => sum + parseFloat(dev.kwh || 0), 0)
+
+  const displayedMeasuredValue = viewMode === 'Daily' ? dailyMeasuredKwh : parseFloat(data?.today?.total_kwh ?? 0)
+
+  console.log('weeklyMeasuredFromSnapshots', weeklyMeasuredFromSnapshots)
+  console.log('weeklyMeasuredFromDevices', weeklyMeasuredFromDevices)
+  console.log('displayedMeasuredValue', displayedMeasuredValue)
 
   // ── Dynamic performance badge ─────────────────────────────────────────
   function getDailyBadge(kwh) {
@@ -448,6 +482,7 @@ export default function Energy() {
         ? getWeeklyBadge(parseFloat(data?.today?.total_kwh ?? 0), _lastWeekKwh)
         : getDailyBadge(_cycleDailyAvg)
 
+  console.log('ENERGY PAGE DEVICES', dailyDevices);
   return (
     <div className="min-h-screen bg-[var(--bg)] pb-24">
       <style>{`
@@ -557,8 +592,8 @@ export default function Energy() {
         cycleDay={cycleDay}
         startDate={startFmt}
         endDate={endFmt}
-        slabName={activeSlab.rate === 0 ? 'Free' : `Slab ${activeSlab.num}`}
-        slabRate={activeSlab.rate}
+        slabName={data?.today?.slab_name || 'Free'}
+        cost={data?.today?.daily_cost || 0}
       />
 
       {/* TABS + DATE NAVIGATOR */}

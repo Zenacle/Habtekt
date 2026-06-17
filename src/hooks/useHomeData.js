@@ -216,17 +216,19 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const rollingStartDate = new Date(`${currentDateStr}T00:00:00+05:30`)
       rollingStartDate.setDate(rollingStartDate.getDate() - 13)
       const rollingStartStr = toLocalISO(rollingStartDate)
-      const rollingEndStr   = currentDateStr
+
+      const minDate = [activeCycle.cycle_start, weekStartReportStr, rollingStartStr].sort()[0]
+      const maxDate = [currentDateStr, weekEndReportStr, activeCycle?.cycle_end || currentDateStr].sort().reverse()[0]
 
       // ── 4. Parallel Queries ───────────────────────────────────────────────
       const [
         todayReportResult,
-        weeklyHistoryResult,
-        cycleReportsResult,
-        cycleSessionsResult,
+        energySnapshotsResult,
+        deviceSnapshotsResult,
         allLastCompletedResult,
         allOpenSessionsResult,
-        rollingReportsResult,
+        readingsForMetaResult,
+        weeklyHistoryResult
       ] = await Promise.all([
         supabase
           .from('daily_reports')
@@ -236,27 +238,20 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .maybeSingle(),
 
         supabase
-          .from('daily_reports')
+          .from('daily_energy_snapshots')
           .select('*')
           .eq('household_id', householdId)
-          .gte('report_date', weekStartReportStr)
-          .lte('report_date', weekEndReportStr)
-          .order('report_date', { ascending: true }),
+          .gte('snapshot_date', minDate)
+          .lte('snapshot_date', maxDate)
+          .order('snapshot_date', { ascending: true }),
 
         supabase
-          .from('daily_reports')
+          .from('daily_device_snapshots')
           .select('*')
           .eq('household_id', householdId)
-          .gte('report_date', activeCycle.cycle_start)
-          .lte('report_date', currentDateStr)
-          .order('report_date', { ascending: true }),
-
-        supabase
-          .from('appliance_readings')
-          .select('*')
-          .eq('household_id', householdId)
-          .gte('session_start', cycleStartIST.toISOString())
-          .order('session_start', { ascending: true }),
+          .gte('snapshot_date', minDate)
+          .lte('snapshot_date', maxDate)
+          .order('snapshot_date', { ascending: true }),
 
         supabase
           .from('appliance_readings')
@@ -275,63 +270,74 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .order('session_start', { ascending: false }),
 
         supabase
+          .from('appliance_readings')
+          .select('device_id, device_name, device_type')
+          .eq('household_id', householdId),
+
+        supabase
           .from('daily_reports')
           .select('*')
           .eq('household_id', householdId)
-          .gte('report_date', rollingStartStr)
-          .lte('report_date', rollingEndStr)
-          .order('report_date', { ascending: true }),
+          .gte('report_date', weekStartReportStr)
+          .lte('report_date', weekEndReportStr)
+          .order('report_date', { ascending: true })
       ])
 
       // ── 5. Build device-name map ──────────────────────────────────────────
       const deviceNameMap = {}
-      const fillMeta = (bd) => {
-        const devs = bd.today || bd.by_device || bd.by_type || {}
-        Object.entries(devs).forEach(([id, d]) => {
-          if (!deviceNameMap[id]) deviceNameMap[id] = { name: d.name, type: d.type }
+      const readingsForMeta = readingsForMetaResult.data || []
+      readingsForMeta.forEach(r => {
+        if (r.device_id && !deviceNameMap[r.device_id]) {
+          deviceNameMap[r.device_id] = {
+            name: r.device_name || r.device_id,
+            type: r.device_type || 'others'
+          }
+        }
+      })
+
+      const energySnapshots = energySnapshotsResult.data || []
+      const deviceSnapshots = deviceSnapshotsResult.data || []
+      console.log('RAW SNAPSHOT DEVICES', deviceSnapshots)
+      const latestReport = todayReportResult.data || null
+
+      const hasSnapshot = energySnapshots.some(s => s.snapshot_date === currentDateStr)
+
+      // ── 6. Construct dailyCosts from energySnapshots ─────────────────────
+      const dailyCosts = []
+      energySnapshots.forEach(s => {
+        const isToday = s.snapshot_date === currentDateStr
+        dailyCosts.push({
+          report_date: s.snapshot_date,
+          measured_kwh: parseFloat(s.measured_kwh || 0),
+          estimated_kwh: parseFloat(s.estimated_kwh || 0),
+          daily_cost: parseFloat(s.cost || 0),
+          is_today: isToday,
+          sessions: new Array(s.total_sessions || 0).fill({})
+        })
+      })
+
+      const hasCurrentDate = dailyCosts.some(d => d.report_date === currentDateStr)
+      if (!hasCurrentDate) {
+        dailyCosts.push({
+          report_date: currentDateStr,
+          measured_kwh: 0,
+          estimated_kwh: 0,
+          daily_cost: 0,
+          is_today: true,
+          sessions: []
         })
       }
-      rollingReportsResult.data?.forEach(r => {
-        try { fillMeta(typeof r.device_type_breakdown === 'string' ? JSON.parse(r.device_type_breakdown) : (r.device_type_breakdown || {})) } catch (e) {}
-      })
-      cycleReportsResult.data?.forEach(r => {
-        try { fillMeta(typeof r.device_type_breakdown === 'string' ? JSON.parse(r.device_type_breakdown) : (r.device_type_breakdown || {})) } catch (e) {}
-      })
-      if (todayReportResult.data) {
-        try { fillMeta(typeof todayReportResult.data.device_type_breakdown === 'string' ? JSON.parse(todayReportResult.data.device_type_breakdown) : todayReportResult.data.device_type_breakdown) } catch (e) {}
-      }
-      cycleSessionsResult.data?.forEach(s => {
-        const id = s.device_id
-        if (!deviceNameMap[id]) {
-          deviceNameMap[id] = { name: s.device_name || id, type: s.device_type || 'others' }
-        }
-      })
 
-      // Sessions by device for rendering weekData chart per device
-      const sessionsByDevice = {}
-      cycleSessionsResult.data?.forEach(s => {
-        if (!sessionsByDevice[s.device_id]) sessionsByDevice[s.device_id] = []
-        if (sessionsByDevice[s.device_id].length < 15) sessionsByDevice[s.device_id].push(s)
-      })
-
-      const allLastCompleted = {}
-      if (allLastCompletedResult.data) {
-        allLastCompletedResult.data.forEach(s => { if (!allLastCompleted[s.device_id]) allLastCompleted[s.device_id] = s })
+      const selectedDaySnapshot = energySnapshots.find(s => s.snapshot_date === currentDateStr) || {
+        measured_kwh: 0,
+        estimated_kwh: 0,
+        cost: 0,
+        total_sessions: 0,
+        total_duration_minutes: 0,
+        slab_name: 'Free',
+        tariff_version: 'TN_NEW_2026'
       }
-      const allOpenSessions = {}
-      if (allOpenSessionsResult.data) {
-        allOpenSessionsResult.data.forEach(s => { if (!allOpenSessions[s.device_id]) allOpenSessions[s.device_id] = s })
-      }
-
-      // Helper to determine the active day IST date string of any session
-      function getActiveISTDateStr(isoStr) {
-        const d = new Date(isoStr)
-        const istDate = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
-        if (istDate.getHours() < 6) {
-          istDate.setDate(istDate.getDate() - 1)
-        }
-        return toLocalISO(istDate)
-      }
+      const activeDayCost = parseFloat(selectedDaySnapshot.cost || 0)
 
       // Helper to generate a range of date strings (YYYY-MM-DD) inclusive
       function getDatesInRange(startStr, endStr) {
@@ -346,75 +352,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         return dates
       }
 
-      // ── 6. Construct Single Source of Truth Daily Records ───────────────
-      const cycleDates = getDatesInRange(activeCycle.cycle_start, currentDateStr)
-      const dailyRecords = []
-
-      cycleDates.forEach(dateStr => {
-        const daySessions = (cycleSessionsResult.data || []).filter(s => getActiveISTDateStr(s.session_start) === dateStr)
-        const report = (cycleReportsResult.data || []).find(r => r.report_date === dateStr)
-        const isToday = dateStr === getActiveISTDateStr(new Date().toISOString())
-        
-        let measured = daySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
-        const coverage = isToday ? 0.6 : parseFloat(report?.coverage_ratio || 0.6)
-        let estimated = coverage > 0 ? measured / coverage : measured
-
-        if (!isToday && report) {
-          if (report.daily_measured_kwh !== null && report.daily_measured_kwh !== undefined) {
-            measured = parseFloat(report.daily_measured_kwh)
-          }
-          if (report.daily_estimated_kwh !== null && report.daily_estimated_kwh !== undefined) {
-            estimated = parseFloat(report.daily_estimated_kwh)
-          }
-        }
-
-        dailyRecords.push({
-          report_date: dateStr,
-          measured_kwh: measured,
-          estimated_kwh: estimated,
-          coverage_ratio: coverage,
-          sessions: daySessions
-        })
-      })
-
-      // ── 7. Calculate Incremental Daily Costs ──────────────────────────────
-      const dailyCosts = []
-      let cumulativeEstimated = 0
-
-      dailyRecords.forEach(r => {
-        const report = (cycleReportsResult.data || []).find(x => x.report_date === r.report_date)
-        const isToday = r.report_date === currentDateStr
-        
-        const prevCumulative = cumulativeEstimated
-        cumulativeEstimated += r.estimated_kwh
-        
-        let cost = calculateTNEBBill(cumulativeEstimated) - calculateTNEBBill(prevCumulative)
-        if (!isToday && report && report.daily_cost !== null && report.daily_cost !== undefined) {
-          cost = parseFloat(report.daily_cost)
-        }
-
-        dailyCosts.push({
-          report_date: r.report_date,
-          measured_kwh: r.measured_kwh,
-          estimated_kwh: r.estimated_kwh,
-          daily_cost: cost,
-          is_today: isToday,
-          sessions: r.sessions
-        })
-      })
-
-      // Find selected day data
-      const selectedDayObj = dailyCosts.find(d => d.report_date === currentDateStr) || {
-        measured_kwh: 0,
-        estimated_kwh: 0,
-        daily_cost: 0,
-        sessions: []
-      }
-
-      const activeDayCost = selectedDayObj.daily_cost
-
-      // ── 8. Aggregation per view mode based on dailyRecords ───────────────
-      let devices = []
+      // ── 7. Aggregations per view mode ─────────────────────────────────────
       let displayKwh = 0
       let kwhAccumulated = 0
       let estimatedFullHomeKwh = 0
@@ -424,40 +362,81 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       let totalHomeSessions = 0
       let hasMoreDevices = false
 
+      // 7a. Weekly Aggregation
       const weekDates = getDatesInRange(toLocalISO(monday), toLocalISO(new Date(nextMonday.getTime() - 24 * 60 * 60 * 1000)))
-      const weekDailyRecords = dailyCosts.filter(d => weekDates.includes(d.report_date))
-      const weeklyMeasured = weekDailyRecords.reduce((sum, d) => sum + d.measured_kwh, 0)
-      const weeklyEstimated = weekDailyRecords.reduce((sum, d) => sum + d.estimated_kwh, 0)
-      weeklyCost = weekDailyRecords.reduce((sum, d) => sum + d.daily_cost, 0)
+      const weekEnergySnapshots = energySnapshots.filter(s => weekDates.includes(s.snapshot_date))
+      const weeklyMeasured = weekEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0)
+      const weeklyEstimated = weekEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.estimated_kwh || 0), 0)
+      weeklyCost = weekEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.cost || 0), 0)
+      const weeklySessions = weekEnergySnapshots.reduce((sum, s) => sum + parseInt(s.total_sessions || 0), 0)
 
-      const billingMeasured = dailyCosts.reduce((sum, d) => sum + d.measured_kwh, 0)
-      const billingEstimated = dailyCosts.reduce((sum, d) => sum + d.estimated_kwh, 0)
-      billingCycleCost = dailyCosts.reduce((sum, d) => sum + d.daily_cost, 0)
+      const periodEnergySnapshots = weekEnergySnapshots;
+      console.log('WEEKLY SNAPSHOTS USED', {
+        startDate: weekStart,
+        endDate: currentDateStr,
+        snapshots: periodEnergySnapshots.map(s => ({
+          date: s.snapshot_date,
+          kwh: s.measured_kwh
+        })),
+        total: periodEnergySnapshots.reduce(
+          (sum, s) => sum + Number(s.measured_kwh || 0),
+          0
+        )
+      })
 
-      let periodSessions = []
+      // 7b. Billing Cycle Aggregation
+      const cycleEnergySnapshots = energySnapshots.filter(s => s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date <= activeCycle.cycle_end)
+      const billingMeasured = cycleEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0)
+      const billingEstimated = cycleEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.estimated_kwh || 0), 0)
+      billingCycleCost = cycleEnergySnapshots.reduce((sum, s) => sum + parseFloat(s.cost || 0), 0)
+      const billingSessions = cycleEnergySnapshots.reduce((sum, s) => sum + parseInt(s.total_sessions || 0), 0)
+
+      console.log('BILLING CYCLE SNAPSHOTS USED', {
+        cycleStart: activeCycle?.cycle_start,
+        cycleEnd: activeCycle?.cycle_end,
+        selectedDate: currentDateStr,
+        snapshotCount: cycleEnergySnapshots.length,
+        totalMeasured: cycleEnergySnapshots.reduce(
+          (sum, s) => sum + Number(s.measured_kwh || 0),
+          0
+        ),
+        firstDate: cycleEnergySnapshots[0]?.snapshot_date,
+        lastDate:
+          cycleEnergySnapshots[cycleEnergySnapshots.length - 1]?.snapshot_date
+      })
 
       if (viewMode === 'Daily') {
-        displayKwh = selectedDayObj.measured_kwh
-        estimatedFullHomeKwh = selectedDayObj.estimated_kwh
-        periodSessions = selectedDayObj.sessions
-        totalHomeSessions = selectedDayObj.sessions.length
+        displayKwh = parseFloat(selectedDaySnapshot.measured_kwh || 0)
+        estimatedFullHomeKwh = parseFloat(selectedDaySnapshot.estimated_kwh || 0)
+        totalHomeSessions = parseInt(selectedDaySnapshot.total_sessions || 0)
       } else if (viewMode === 'Weekly') {
         displayKwh = weeklyMeasured
         weeklyKwh = weeklyMeasured
         estimatedFullHomeKwh = weeklyEstimated
-        periodSessions = weekDailyRecords.flatMap(d => d.sessions)
-        totalHomeSessions = periodSessions.length
+        totalHomeSessions = weeklySessions
       } else {
         // Billing Cycle
         displayKwh = billingMeasured
         kwhAccumulated = billingMeasured
         estimatedFullHomeKwh = billingEstimated
-        periodSessions = dailyCosts.flatMap(d => d.sessions)
-        totalHomeSessions = periodSessions.length
+        totalHomeSessions = billingSessions
       }
 
-      // Group periodSessions by device
-      const aggregated = {}
+      // ── 8. Aggregate devices for selected period ─────────────────────────
+      let periodDeviceSnapshots = []
+      if (viewMode === 'Daily') {
+        if (hasSnapshot) {
+          periodDeviceSnapshots = deviceSnapshots.filter(s => s.snapshot_date === currentDateStr)
+        } else {
+          periodDeviceSnapshots = []
+        }
+      } else if (viewMode === 'Weekly') {
+        periodDeviceSnapshots = deviceSnapshots.filter(s => weekDates.includes(s.snapshot_date))
+      } else {
+        periodDeviceSnapshots = deviceSnapshots.filter(s => s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date <= activeCycle.cycle_end)
+      }
+
+      const aggregatedDevices = {}
       const weekTemplate = []
       const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
       for (let i = 0; i < 7; i++) {
@@ -466,43 +445,60 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         weekTemplate.push({ date: toLocalISO(d), day: dayNames[d.getDay()], kwh: 0, mins: 0 })
       }
 
-      periodSessions.forEach(s => {
+      for (const s of periodDeviceSnapshots) {
         const id = s.device_id
-        const resolvedName = deviceNameMap[id]?.name || id
-        const type = deviceNameMap[id]?.type || 'others'
-        if (!aggregated[id]) {
-          aggregated[id] = {
+        if (!aggregatedDevices[id]) {
+          const metaName = s.device_name || deviceNameMap[id]?.name || id
+          const metaType = s.device_type || deviceNameMap[id]?.type || 'others'
+          aggregatedDevices[id] = {
             device_id: id,
-            name: resolvedName,
-            type,
+            name: metaName,
+            type: metaType,
+            floor: s.floor || null,
+            room: s.room || null,
             kwh: 0,
             minutes: 0,
             session_count: 0,
-            sessions: sessionsByDevice[id] || [],
+            cost: 0,
             weekData: JSON.parse(JSON.stringify(weekTemplate))
           }
         }
-        const kwh = parseFloat(s.kwh_consumed || 0)
-        const mins = parseInt(s.duration_minutes || 0, 10)
-        aggregated[id].kwh += kwh
-        aggregated[id].minutes += mins
-        aggregated[id].session_count += 1
+        const kwhVal = parseFloat(s.measured_kwh || 0)
+        const minsVal = parseInt(s.total_duration_minutes || 0)
+        aggregatedDevices[id].kwh += kwhVal
+        aggregatedDevices[id].minutes += minsVal
+        aggregatedDevices[id].session_count += parseInt(s.total_sessions || 0)
+        aggregatedDevices[id].cost += parseFloat(s.cost || 0)
 
-        const istDate = getActiveISTDateStr(s.session_start)
-        const bar = aggregated[id].weekData.find(w => w.date === istDate)
+        const bar = aggregatedDevices[id].weekData.find(w => w.date === s.snapshot_date)
         if (bar) {
-          bar.kwh += kwh
-          bar.mins += mins
+          bar.kwh += kwhVal
+          bar.mins += minsVal
         }
-      })
+      }
 
-      devices = Object.values(aggregated)
-        .filter(d => d.kwh > 0.001 || d.minutes > 0)
+      const devices = Object.values(aggregatedDevices)
         .sort((a, b) => b.kwh - a.kwh)
+
+      console.log('TEMPORARY LOGS:', {
+        selectedDate: currentDateStr,
+        currentDateStr,
+        periodDeviceSnapshotsLength: periodDeviceSnapshots.length,
+        devicesLength: devices.length,
+        firstDeviceSnapshotRecord: periodDeviceSnapshots[0] || null
+      });
 
       hasMoreDevices = devices.length > 3
 
-      // ── 9. Attach metadata to each device ────────────────────────────────
+      const allLastCompleted = {}
+      if (allLastCompletedResult.data) {
+        allLastCompletedResult.data.forEach(s => { if (!allLastCompleted[s.device_id]) allLastCompleted[s.device_id] = s })
+      }
+      const allOpenSessions = {}
+      if (allOpenSessionsResult.data) {
+        allOpenSessionsResult.data.forEach(s => { if (!allOpenSessions[s.device_id]) allOpenSessions[s.device_id] = s })
+      }
+
       devices.forEach(d => {
         d.totalKwh = d.kwh
         d.totalSessions = d.session_count
@@ -512,37 +508,28 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         if (d.openSession) d.is_currently_active = true
       })
 
-      // ── 10. Misc derived values ───────────────────────────────────────────
-      const latestReport = todayReportResult.data || weeklyHistoryResult.data?.[weeklyHistoryResult.data.length - 1]
-      let weather = null
-      try { weather = typeof latestReport?.weather_context === 'string' ? JSON.parse(latestReport.weather_context) : (latestReport?.weather_context ?? null) } catch (e) {}
+      // ── 9. Misc derived values ───────────────────────────────────────────
+      const historySnapshots = energySnapshots
+        .filter(s => s.snapshot_date < currentDateStr)
+        .sort((a, b) => b.snapshot_date.localeCompare(a.snapshot_date))
 
-      // Rolling 7-day average (uses already-fetched rollingReportsResult)
-      const allRollingReports     = [...(rollingReportsResult.data ?? [])].reverse()
-      const reportsExcludingToday = allRollingReports.filter(r => r.report_date !== currentDateStr)
-
-      const nonZeroLast7 = reportsExcludingToday
-        .slice(0, 7)
-        .filter(r => parseFloat(r.total_kwh ?? 0) > 0)
-
+      const last7Days = historySnapshots.slice(0, 7)
+      const nonZeroLast7 = last7Days.filter(s => parseFloat(s.measured_kwh || 0) > 0)
       const avg7DayKwh = nonZeroLast7.length >= 3
-        ? nonZeroLast7.reduce((s, r) => s + parseFloat(r.total_kwh ?? 0), 0) / nonZeroLast7.length
+        ? nonZeroLast7.reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0) / nonZeroLast7.length
         : 0
 
-      const lastWeekKwh = reportsExcludingToday
-        .slice(7, 14)
-        .reduce((s, r) => s + parseFloat(r.total_kwh ?? 0), 0)
+      const lastWeekKwh = historySnapshots.slice(7, 14).reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0)
 
       const belowThreshold = avg7DayKwh > 0 ? avg7DayKwh * 0.75 : 0
       const aboveThreshold = avg7DayKwh > 0 ? avg7DayKwh * 1.25 : 0
 
-      // Billing-cycle daily average
       const _cycleStartDate  = new Date(activeCycle?.cycle_start ?? currentDateStr)
       const _todayDateForAvg = new Date(currentDateStr)
       const _daysElapsed     = Math.max(1, Math.ceil((_todayDateForAvg - _cycleStartDate) / (1000 * 60 * 60 * 24)))
       const cycleDailyAvg    = _daysElapsed > 0 ? billingMeasured / _daysElapsed : 0
 
-      // ── 11. Slab Calculation (TNEB) ──────────────────────────────────────
+      // ── 10. Slab Calculation (TNEB) ──────────────────────────────────────
       const kwhEstimated = billingEstimated
       const generateSlabStatus = (measured, estimated) => {
         const slabs = getSlabs(estimated)
@@ -578,7 +565,14 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         ? Math.max(0, Math.ceil((cycleEndDate - nowForCycle) / (1000 * 60 * 60 * 24)))
         : 0
 
-      // ── 12. Set data ──────────────────────────────────────────────────────
+      let weather = null
+      try { weather = typeof latestReport?.weather_context === 'string' ? JSON.parse(latestReport.weather_context) : (latestReport?.weather_context ?? null) } catch (e) {}
+
+      // ── 11. Set data ──────────────────────────────────────────────────────
+      console.log('FINAL WEEKLY MEASURED', weeklyMeasured)
+      console.log('FINAL BILLING MEASURED', billingMeasured)
+      console.log('FINAL DISPLAY KWH', displayKwh)
+      console.log('RETURN DEVICES', devices);
       setData({
         today: {
           total_kwh: displayKwh,
@@ -587,8 +581,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           session_count: totalHomeSessions,
           devices,
           hasMoreDevices,
-          open_sessions: (cycleSessionsResult.data || [])
-            .filter(s => !s.session_end)
+          open_sessions: (allOpenSessionsResult.data || [])
             .map(s => ({
               device_id: s.device_id,
               name: deviceNameMap[s.device_id]?.name || s.device_id,
@@ -600,6 +593,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           daily_estimated_full_home_kwh: (dailyCosts.find(d => d.report_date === getActiveDateStr())?.estimated_kwh || 0),
           estimated_cost_inr: activeDayCost,
           daily_cost: activeDayCost,
+          slab_name: selectedDaySnapshot.slab_name || 'Free',
           weekly_cost: weeklyCost,
           report_date: currentDateStr,
           as_of_ist: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
@@ -617,8 +611,8 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           cycle_display_end: cycleDisplayEnd,
           cycle_days_left: cycleDaysLeft,
           slab_status: slabStatus,
-          current_slab_name: currentSlab?.name,
-          current_slab_rate: currentSlab?.rate,
+          current_slab_name: currentSlab?.name || selectedDaySnapshot.slab_name || 'Free',
+          current_slab_rate: currentSlab?.rate || 0,
           billing_cycle_cost: billingCycleCost
         },
         weekWindow: { monday, nextMonday },
@@ -627,6 +621,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         history: weeklyHistoryResult.data || [],
         dailyCosts
       })
+      console.log('SETDATA TOTAL_KWH', displayKwh)
 
     } catch (err) {
       setError(err)
