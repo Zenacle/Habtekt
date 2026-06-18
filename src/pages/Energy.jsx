@@ -221,32 +221,45 @@ export default function Energy() {
   }, [activeDailyReport])
 
   const dailyDevices = useMemo(() => {
+    let devices = []
     if (data?.today?.devices) {
-      return data.today.devices.map(d => ({
+      devices = data.today.devices.map(d => ({
         name: d.name,
         kwh: parseFloat(d.kwh || 0),
         minutes: parseInt(d.minutes || 0, 10),
         type: d.type || 'Unknown Device'
       }))
+    } else {
+      const devs = dailyReportBreakdown.today || dailyReportBreakdown.by_device || dailyReportBreakdown.by_type || {}
+      if (Array.isArray(devs)) {
+        devices = devs.map(d => ({
+          name: d.name || d.type || 'Unknown Device',
+          kwh: parseFloat(d.kwh || 0),
+          minutes: parseInt(d.minutes || 0, 10),
+          ...d
+        }))
+      } else {
+        devices = Object.entries(devs).map(([key, val]) => ({
+          device_id: key,
+          name: val.name || val.type || key,
+          kwh: parseFloat(val.kwh || 0),
+          minutes: parseInt(val.minutes || 0, 10),
+          sessions: parseInt(val.sessions || 0, 10),
+          ...val
+        }))
+      }
     }
-    const devs = dailyReportBreakdown.today || dailyReportBreakdown.by_device || dailyReportBreakdown.by_type || {}
-    if (Array.isArray(devs)) {
-      return devs.map(d => ({
-        name: d.name || d.type || 'Unknown Device',
-        kwh: parseFloat(d.kwh || 0),
-        minutes: parseInt(d.minutes || 0, 10),
-        ...d
-      }))
-    }
-    return Object.entries(devs).map(([key, val]) => ({
-      device_id: key,
-      name: val.name || val.type || key,
-      kwh: parseFloat(val.kwh || 0),
-      minutes: parseInt(val.minutes || 0, 10),
-      sessions: parseInt(val.sessions || 0, 10),
-      ...val
-    }))
-  }, [dailyReportBreakdown, data?.today?.devices])
+
+    console.log('ENERGY PAGE DEVICES', devices)
+    console.log('ENERGY PAGE TOTAL', devices.reduce((s,d)=>s+d.kwh,0))
+    console.log('ENERGY SOURCE TABLE:', selectedDateStr === activeDateStr ? 'appliance_readings' : 'daily_device_snapshots')
+    console.log('ENERGY DATE RANGE:', {
+      startDate: selectedDateStr,
+      endDate: selectedDateStr
+    })
+
+    return devices
+  }, [dailyReportBreakdown, data?.today?.devices, selectedDateStr, activeDateStr])
 
   const topDevice = useMemo(() => {
     if (dailyMeasuredKwh === 0 && dailyEstimatedFullHome === 0) return null
