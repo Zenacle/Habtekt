@@ -37,6 +37,24 @@ function getInitialCycleDates(currentDateStr) {
   return { cycleStart, cycleEnd }
 }
 
+const DEVICE_METADATA_MAP = {
+  'ea0b66d3-0d00-4a70-8b87-cab8908d9e38': { floor: '1st Floor', room: 'Bedroom' },
+  '3b896f6f-0e7f-44ff-acd3-33d82ef11aa7': { floor: 'Ground Floor', room: 'Living Room' },
+  'ff320fc1-0cbd-4af4-9dcc-98711ce67bde': { floor: 'Ground Floor', room: 'Utility' },
+  '2ec92fd0-d62f-49a2-86e9-a5dafbb5bc6a': { floor: '1st Floor', room: 'Bathroom' },
+  'a2814a9c-b2ca-4607-9ce9-acf311548440': { floor: 'Ground Floor', room: 'Bathroom' }
+}
+
+function getSlabName(cumulativeEstimatedUnits) {
+  if (cumulativeEstimatedUnits <= 100) return 'Free';
+  if (cumulativeEstimatedUnits <= 200) return 'Slab 2';
+  if (cumulativeEstimatedUnits <= 400) return 'Slab 3';
+  if (cumulativeEstimatedUnits <= 500) return 'Slab 4';
+  if (cumulativeEstimatedUnits <= 600) return 'Above 500';
+  if (cumulativeEstimatedUnits <= 800) return 'Above 600';
+  if (cumulativeEstimatedUnits <= 1000) return 'Above 800';
+  return 'Above 1000';
+}
 
 // ── IST helpers ───────────────────────────────────────────────────────────────
 
@@ -217,8 +235,19 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       rollingStartDate.setDate(rollingStartDate.getDate() - 13)
       const rollingStartStr = toLocalISO(rollingStartDate)
 
-      const minDate = [activeCycle.cycle_start, weekStartReportStr, rollingStartStr].sort()[0]
-      const maxDate = [currentDateStr, weekEndReportStr, activeCycle?.cycle_end || currentDateStr].sort().reverse()[0]
+      let minDate = [activeCycle.cycle_start, weekStartReportStr, rollingStartStr].sort()[0]
+      let maxDate = [currentDateStr, weekEndReportStr, activeCycle?.cycle_end || currentDateStr].sort().reverse()[0]
+
+      const selectedYear = new Date(currentDateStr + 'T00:00:00').getFullYear()
+      const yearStart = `${selectedYear}-01-01`
+      const yearEnd   = `${selectedYear}-12-31`
+
+      if (viewMode === 'Yearly') {
+        if (yearStart < minDate) minDate = yearStart
+        if (yearEnd > maxDate) maxDate = yearEnd
+      }
+
+      const isToday = currentDateStr === getActiveDateStr()
 
       // ── 4. Parallel Queries ───────────────────────────────────────────────
       const [
@@ -228,7 +257,9 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         allLastCompletedResult,
         allOpenSessionsResult,
         readingsForMetaResult,
-        weeklyHistoryResult
+        weeklyHistoryResult,
+        todayReadingsResult,
+        devicesResult
       ] = await Promise.all([
         supabase
           .from('daily_reports')
@@ -280,17 +311,95 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .eq('household_id', householdId)
           .gte('report_date', weekStartReportStr)
           .lte('report_date', weekEndReportStr)
-          .order('report_date', { ascending: true })
+          .order('report_date', { ascending: true }),
+
+        isToday
+          ? supabase
+              .from('appliance_readings')
+              .select('*')
+              .eq('household_id', householdId)
+              .gte('session_start', dayWindowStart(currentDateStr).toISOString())
+          : Promise.resolve({ data: [] }),
+
+        supabase
+          .from('devices')
+          .select('id, device_name, device_type, floor, room')
       ])
 
       // ── 5. Build device-name map ──────────────────────────────────────────
+      const devicesList = devicesResult.data || []
+      const devicesById = {}
+
+      const STATIC_DEVICES_MAP = {
+        'ea0b66d3-0d00-4a70-8b87-cab8908d9e38': {
+          id: 'ea0b66d3-0d00-4a70-8b87-cab8908d9e38',
+          device_name: 'AC - 1st Floor',
+          device_type: 'ac',
+          floor: '1st Floor',
+          room: 'Bedroom'
+        },
+        'a2814a9c-b2ca-4607-9ce9-acf311548440': {
+          id: 'a2814a9c-b2ca-4607-9ce9-acf311548440',
+          device_name: 'Heater - GF',
+          device_type: 'geyser',
+          floor: 'Ground Floor',
+          room: 'Bathroom'
+        },
+        '3b896f6f-0e7f-44ff-acd3-33d82ef11aa7': {
+          id: '3b896f6f-0e7f-44ff-acd3-33d82ef11aa7',
+          device_name: 'AC - GF',
+          device_type: 'ac',
+          floor: 'Ground Floor',
+          room: 'Living Room'
+        },
+        'ff320fc1-0cbd-4af4-9dcc-98711ce67bde': {
+          id: 'ff320fc1-0cbd-4af4-9dcc-98711ce67bde',
+          device_name: 'Water Pump',
+          device_type: 'pump',
+          floor: 'Ground Floor',
+          room: 'Utility'
+        },
+        '2ec92fd0-d62f-49a2-86e9-a5dafbb5bc6a': {
+          id: '2ec92fd0-d62f-49a2-86e9-a5dafbb5bc6a',
+          device_name: 'Heater - 1st Floor',
+          device_type: 'geyser',
+          floor: '1st Floor',
+          room: 'Bathroom'
+        }
+      }
+
+      Object.entries(STATIC_DEVICES_MAP).forEach(([id, dev]) => {
+        devicesById[id] = dev
+      })
+
+      devicesList.forEach(d => {
+        devicesById[d.id] = d
+      })
+
       const deviceNameMap = {}
       const readingsForMeta = readingsForMetaResult.data || []
       readingsForMeta.forEach(r => {
         if (r.device_id && !deviceNameMap[r.device_id]) {
+          const dbDevice = devicesById[r.device_id]
           deviceNameMap[r.device_id] = {
-            name: r.device_name || r.device_id,
-            type: r.device_type || 'others'
+            name: dbDevice?.device_name || dbDevice?.name || r.device_name || r.device_id,
+            type: dbDevice?.device_type || r.device_type || 'others'
+          }
+        }
+      })
+      devicesList.forEach(d => {
+        if (!deviceNameMap[d.id]) {
+          deviceNameMap[d.id] = {
+            name: d.device_name || d.name || d.id,
+            type: d.device_type || 'others'
+          }
+        }
+      })
+      Object.entries(STATIC_DEVICES_MAP).forEach(([id, d]) => {
+        if (!deviceNameMap[id]) {
+          deviceNameMap[id] = {
+            name: d.device_name,
+            type: d.device_type
           }
         }
       })
@@ -298,44 +407,108 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const energySnapshots = energySnapshotsResult.data || []
       const deviceSnapshots = deviceSnapshotsResult.data || []
       console.log('RAW SNAPSHOT DEVICES', deviceSnapshots)
+
+      const yearlyEnergySnapshots = energySnapshots.filter(
+        s => s.snapshot_date >= yearStart && s.snapshot_date <= yearEnd
+      )
+      const yearlyMeasured = yearlyEnergySnapshots.reduce(
+        (sum, s) => sum + Number(s.measured_kwh || 0),
+        0
+      )
+      const yearlyDeviceSnapshots = deviceSnapshots.filter(
+        s => s.snapshot_date >= yearStart && s.snapshot_date <= yearEnd
+      )
       const latestReport = todayReportResult.data || null
 
-      const hasSnapshot = energySnapshots.some(s => s.snapshot_date === currentDateStr)
+      const hasSnapshot = !isToday && energySnapshots.some(s => s.snapshot_date === currentDateStr)
 
       // ── 6. Construct dailyCosts from energySnapshots ─────────────────────
       const dailyCosts = []
       energySnapshots.forEach(s => {
-        const isToday = s.snapshot_date === currentDateStr
+        if (isToday && s.snapshot_date === currentDateStr) {
+          return
+        }
+        const isTodaySnapshot = s.snapshot_date === currentDateStr
         dailyCosts.push({
           report_date: s.snapshot_date,
           measured_kwh: parseFloat(s.measured_kwh || 0),
           estimated_kwh: parseFloat(s.estimated_kwh || 0),
           daily_cost: parseFloat(s.cost || 0),
-          is_today: isToday,
+          is_today: isTodaySnapshot,
           sessions: new Array(s.total_sessions || 0).fill({})
         })
       })
 
-      const hasCurrentDate = dailyCosts.some(d => d.report_date === currentDateStr)
-      if (!hasCurrentDate) {
-        dailyCosts.push({
-          report_date: currentDateStr,
-          measured_kwh: 0,
-          estimated_kwh: 0,
-          daily_cost: 0,
-          is_today: true,
-          sessions: []
-        })
+      let todayMeasuredKwh = 0
+      let todayEstimatedKwh = 0
+      let todayCost = 0
+      let todaySessionsCount = 0
+      let todayDuration = 0
+      let currCumulativeEstimated = 0
+
+      if (isToday) {
+        const todayReadings = todayReadingsResult.data || []
+        todayMeasuredKwh = todayReadings.reduce((sum, r) => sum + parseFloat(r.kwh_consumed || 0), 0)
+        const coverageRatio = todayReportResult.data?.coverage_ratio ?? 0.6
+        todayEstimatedKwh = coverageRatio > 0 ? todayMeasuredKwh / coverageRatio : todayMeasuredKwh
+        todaySessionsCount = todayReadings.length
+        todayDuration = todayReadings.reduce((sum, r) => sum + parseInt(r.duration_minutes || 0), 0)
+
+        const pastCycleSnapshots = energySnapshots.filter(
+          s => s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date < currentDateStr
+        )
+        const prevCumulativeEstimated = pastCycleSnapshots.reduce(
+          (sum, s) => sum + parseFloat(s.estimated_kwh || 0),
+          0
+        )
+        currCumulativeEstimated = prevCumulativeEstimated + todayEstimatedKwh
+        todayCost = calculateTNEBBill(currCumulativeEstimated) - calculateTNEBBill(prevCumulativeEstimated)
       }
 
-      const selectedDaySnapshot = energySnapshots.find(s => s.snapshot_date === currentDateStr) || {
-        measured_kwh: 0,
-        estimated_kwh: 0,
-        cost: 0,
-        total_sessions: 0,
-        total_duration_minutes: 0,
-        slab_name: 'Free',
-        tariff_version: 'TN_NEW_2026'
+      const hasCurrentDate = dailyCosts.some(d => d.report_date === currentDateStr)
+      if (!hasCurrentDate) {
+        if (isToday) {
+          dailyCosts.push({
+            report_date: currentDateStr,
+            measured_kwh: todayMeasuredKwh,
+            estimated_kwh: todayEstimatedKwh,
+            daily_cost: todayCost,
+            is_today: true,
+            sessions: new Array(todaySessionsCount).fill({})
+          })
+        } else {
+          dailyCosts.push({
+            report_date: currentDateStr,
+            measured_kwh: 0,
+            estimated_kwh: 0,
+            daily_cost: 0,
+            is_today: true,
+            sessions: []
+          })
+        }
+      }
+
+      let selectedDaySnapshot
+      if (isToday) {
+        selectedDaySnapshot = {
+          measured_kwh: todayMeasuredKwh,
+          estimated_kwh: todayEstimatedKwh,
+          cost: todayCost,
+          total_sessions: todaySessionsCount,
+          total_duration_minutes: todayDuration,
+          slab_name: getSlabName(currCumulativeEstimated),
+          tariff_version: activeCycle.cycle_start < '2026-05-28' ? 'TN_OLD_2025' : 'TN_NEW_2026'
+        }
+      } else {
+        selectedDaySnapshot = energySnapshots.find(s => s.snapshot_date === currentDateStr) || {
+          measured_kwh: 0,
+          estimated_kwh: 0,
+          cost: 0,
+          total_sessions: 0,
+          total_duration_minutes: 0,
+          slab_name: 'Free',
+          tariff_version: 'TN_NEW_2026'
+        }
       }
       const activeDayCost = parseFloat(selectedDaySnapshot.cost || 0)
 
@@ -414,6 +587,10 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         weeklyKwh = weeklyMeasured
         estimatedFullHomeKwh = weeklyEstimated
         totalHomeSessions = weeklySessions
+      } else if (viewMode === 'Yearly') {
+        displayKwh = yearlyMeasured
+        estimatedFullHomeKwh = yearlyEnergySnapshots.reduce((sum, s) => sum + Number(s.estimated_kwh || 0), 0)
+        totalHomeSessions = yearlyEnergySnapshots.reduce((sum, s) => sum + Number(s.total_sessions || 0), 0)
       } else {
         // Billing Cycle
         displayKwh = billingMeasured
@@ -425,13 +602,73 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       // ── 8. Aggregate devices for selected period ─────────────────────────
       let periodDeviceSnapshots = []
       if (viewMode === 'Daily') {
-        if (hasSnapshot) {
+        if (isToday) {
+          const todayReadings = todayReadingsResult.data || []
+          const readingsByDevice = {}
+          todayReadings.forEach(r => {
+            const id = r.device_id
+            if (!readingsByDevice[id]) {
+              readingsByDevice[id] = []
+            }
+            readingsByDevice[id].push(r)
+          })
+
+          const devicesData = devicesResult.data
+          const liveReadings = todayReadings
+
+          console.log('DEVICES TABLE', devicesData)
+
+          console.log('DEVICE NAME MAP', deviceNameMap)
+
+          console.log('LIVE READINGS', liveReadings.map(r => ({
+            device_id: r.device_id,
+            kwh: r.kwh_consumed
+          })))
+
+          liveReadings.forEach(r => {
+            console.log('LOOKUP TEST', {
+              deviceId: r.device_id,
+              resolvedName: deviceNameMap[r.device_id]
+            })
+          })
+
+          periodDeviceSnapshots = Object.entries(readingsByDevice).map(([deviceId, devReadings]) => {
+            const devMeasuredKwh = devReadings.reduce((sum, r) => sum + parseFloat(r.kwh_consumed || 0), 0)
+            const devCost = todayMeasuredKwh > 0 ? (devMeasuredKwh / todayMeasuredKwh) * todayCost : 0
+            const devDuration = devReadings.reduce((sum, r) => sum + parseInt(r.duration_minutes || 0), 0)
+
+            const device = devicesById[deviceId] || { id: deviceId, device_name: undefined }
+            console.log('DEVICE NAME MAPPING', {
+              deviceId: device.id,
+              deviceName: device.device_name
+            })
+
+            const displayName = device.device_name || device.name || 'Unknown Device'
+
+            const info = deviceNameMap[deviceId] || {}
+            const meta = DEVICE_METADATA_MAP[deviceId] || {}
+            return {
+              device_id: deviceId,
+              device_name: displayName,
+              device_type: device.device_type || devReadings[0]?.device_type || info.type || 'others',
+              floor: device.floor || meta.floor || null,
+              room: device.room || meta.room || null,
+              measured_kwh: devMeasuredKwh,
+              total_duration_minutes: devDuration,
+              total_sessions: devReadings.length,
+              cost: devCost,
+              snapshot_date: currentDateStr
+            }
+          })
+        } else if (hasSnapshot) {
           periodDeviceSnapshots = deviceSnapshots.filter(s => s.snapshot_date === currentDateStr)
         } else {
           periodDeviceSnapshots = []
         }
       } else if (viewMode === 'Weekly') {
         periodDeviceSnapshots = deviceSnapshots.filter(s => weekDates.includes(s.snapshot_date))
+      } else if (viewMode === 'Yearly') {
+        periodDeviceSnapshots = yearlyDeviceSnapshots
       } else {
         periodDeviceSnapshots = deviceSnapshots.filter(s => s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date <= activeCycle.cycle_end)
       }
@@ -479,6 +716,20 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
 
       const devices = Object.values(aggregatedDevices)
         .sort((a, b) => b.kwh - a.kwh)
+
+      const yearlyDevices = viewMode === 'Yearly' ? devices : []
+
+      if (viewMode === 'Yearly') {
+        console.log('YEARLY ENERGY SNAPSHOTS', yearlyEnergySnapshots)
+
+        console.log('YEARLY DEVICE SNAPSHOTS', yearlyDeviceSnapshots)
+
+        console.log('YEARLY MEASURED', yearlyMeasured)
+
+        console.log('YEARLY DEVICE TOTAL', yearlyDevices.reduce(
+          (s,d)=>s+Number(d.kwh||0),0
+        ))
+      }
 
       console.log('TEMPORARY LOGS:', {
         selectedDate: currentDateStr,
@@ -587,7 +838,8 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
               name: deviceNameMap[s.device_id]?.name || s.device_id,
               started_ist: new Date(s.session_start).toLocaleTimeString('en-IN', {
                 hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata'
-              })
+              }),
+              started_raw: s.session_start
             })),
           estimated_full_home_kwh: estimatedFullHomeKwh,
           daily_estimated_full_home_kwh: (dailyCosts.find(d => d.report_date === getActiveDateStr())?.estimated_kwh || 0),
