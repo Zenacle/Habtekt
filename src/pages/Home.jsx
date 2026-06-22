@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { useHomeData } from '../hooks/useHomeData'
+import { useHomeData, getActiveDateStr } from '../hooks/useHomeData'
 import BottomNav from '../components/BottomNav'
 import EnergyGraph from '../components/EnergyGraph'
 import { 
@@ -694,6 +694,24 @@ export default function Home() {
   const { session, household } = useAuth()
   const [viewMode, setViewMode] = useState('Daily')
   const { data, loading } = useHomeData(household?.id, viewMode)
+
+  // Add console logs for Home Page
+  useEffect(() => {
+    if (!loading && data) {
+      const activeDay = getActiveDateStr()
+      // Home page is always today (live date)
+      const selectedDate = activeDay
+      const sourceUsed = 'live'
+      const measuredValue = data.today?.total_kwh || 0
+      const deviceCount = data.today?.devices?.length || 0
+      console.log('Home Page Logs:')
+      console.log('selectedDate', selectedDate)
+      console.log('activeDay', activeDay)
+      console.log('sourceUsed', sourceUsed)
+      console.log('measuredValue', measuredValue)
+      console.log('deviceCount', deviceCount)
+    }
+  }, [loading, data])
 
   const handleViewModeChange = (newMode) => {
     setViewMode(newMode)

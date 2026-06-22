@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import BottomNav from '../components/BottomNav'
-import { calculateTNEBBill } from '../utils/tariff'
+import { useHomeData, getActiveDateStr } from '../hooks/useHomeData'
 import {
   BarChart,
   Bar,
@@ -135,8 +135,7 @@ export default function Appliances() {
 
   // Active IST date & calendar boundary todayStr
   const activeDateStr = useMemo(() => {
-    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
-    return getActiveISTDateStr(nowIST.toISOString())
+    return getActiveDateStr()
   }, [])
 
   const todayStr = useMemo(() => new Date().toISOString().split('T')[0], [])
@@ -144,139 +143,21 @@ export default function Appliances() {
   const [period, setPeriod] = useState('Today')
   const [selectedDateStr, setSelectedDateStr] = useState(activeDateStr)
   const [openId, setOpenId] = useState(null)
-  
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
 
-  const [activeCycle, setActiveCycle] = useState(null)
-  const [allCycles, setAllCycles] = useState([])
-  const [dailyCostsMap, setDailyCostsMap] = useState({})
-  const [allReadings, setAllReadings] = useState([])
-  const [deviceSnapshots, setDeviceSnapshots] = useState([])
+  const hookViewMode = useMemo(() => {
+    if (period === 'Today') return 'Daily'
+    return period
+  }, [period])
+
+  const { data, loading, error } = useHomeData(householdId, hookViewMode, selectedDateStr)
 
   const selectedYear = useMemo(() => {
     return new Date(selectedDateStr + 'T00:00:00').getFullYear()
   }, [selectedDateStr])
 
-  useEffect(() => {
-    if (!householdId) return
-    
-    async function loadAllData() {
-      setLoading(true)
-      try {
-        // 1. Get billing cycles for the household
-        const { data: cycles } = await supabase
-          .from('billing_cycle_summary')
-          .select('*')
-          .eq('household_id', householdId)
-          .order('cycle_start', { ascending: false })
-
-        setAllCycles(cycles || [])
-
-        // Find cycle containing selectedDateStr
-        const cycle = cycles?.find(c => selectedDateStr >= c.cycle_start && selectedDateStr < c.cycle_end) || cycles?.[0] || null
-        setActiveCycle(cycle)
-
-        if (!cycle) {
-          throw new Error('No billing cycle found.')
-        }
-
-        // Fetch selectedYear bounds
-        const yearStartIST = `${selectedYear}-01-01T06:00:00+05:30`
-        const yearEndIST = `${selectedYear + 1}-01-01T06:00:00+05:30`
-
-        // 2. Fetch daily energy snapshots, readings, and device snapshots in parallel
-        const [energySnapsRes, readingsRes, deviceSnapsRes] = await Promise.all([
-          supabase
-            .from('daily_energy_snapshots')
-            .select('*')
-            .eq('household_id', householdId)
-            .gte('snapshot_date', `${selectedYear}-01-01`)
-            .lte('snapshot_date', `${selectedYear}-12-31`),
-          supabase
-            .from('appliance_readings')
-            .select('*')
-            .eq('household_id', householdId)
-            .gte('session_start', new Date(yearStartIST).toISOString())
-            .lt('session_start', new Date(yearEndIST).toISOString()),
-          supabase
-            .from('daily_device_snapshots')
-            .select('*')
-            .eq('household_id', householdId)
-            .gte('snapshot_date', `${selectedYear}-01-01`)
-            .lte('snapshot_date', `${selectedYear}-12-31`)
-        ])
-
-        if (energySnapsRes.error) throw energySnapsRes.error
-        if (readingsRes.error) throw readingsRes.error
-        if (deviceSnapsRes.error) throw deviceSnapsRes.error
-
-        const readings = readingsRes.data || []
-        setAllReadings(readings)
-
-        const energySnaps = energySnapsRes.data || []
-        const deviceSnaps = deviceSnapsRes.data || []
-        setDeviceSnapshots(deviceSnaps)
-
-        // Compute incremental daily costs chronologically for each cycle in the calendar year
-        const computedMap = {}
-        
-        ;(cycles || []).forEach(c => {
-          const cycleStart = c.cycle_start
-          const cycleEnd = c.cycle_end
-          
-          // Last date is exclusive of cycleEnd
-          const lastDateObj = new Date(cycleEnd + 'T00:00:00')
-          lastDateObj.setDate(lastDateObj.getDate() - 1)
-          const lastDateStr = lastDateObj.toISOString().split('T')[0]
-          
-          const endBoundStr = lastDateStr < activeDateStr ? lastDateStr : activeDateStr
-          if (cycleStart > endBoundStr) return
-          
-          const datesInCycle = getDatesInRange(cycleStart, endBoundStr)
-          let cumulativeEstimated = 0
-
-          datesInCycle.forEach(dateStr => {
-            const isToday = dateStr === activeDateStr
-            let measured = 0
-            let estimated = 0
-            let cost = 0
-
-            if (isToday) {
-              const daySessions = readings.filter(s => getActiveISTDateStr(s.session_start) === dateStr)
-              measured = daySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
-              const coverage = 0.6
-              estimated = measured / coverage
-              const prevCumulative = cumulativeEstimated
-              cumulativeEstimated += estimated
-              cost = calculateTNEBBill(cumulativeEstimated) - calculateTNEBBill(prevCumulative)
-            } else {
-              const snap = energySnaps.find(s => s.snapshot_date === dateStr)
-              measured = snap ? parseFloat(snap.measured_kwh || 0) : 0
-              estimated = snap ? parseFloat(snap.estimated_kwh || 0) : 0
-              cost = snap ? parseFloat(snap.cost || 0) : 0
-              cumulativeEstimated += estimated
-            }
-
-            computedMap[dateStr] = {
-              measured_kwh: measured,
-              estimated_kwh: estimated,
-              daily_cost: cost
-            }
-          })
-        })
-
-        setDailyCostsMap(computedMap)
-      } catch (err) {
-        console.error(err)
-        setError(err)
-      } finally {
-        setLoading(false)
-      }
-    }
-
-    loadAllData()
-  }, [householdId, selectedYear, activeDateStr])
+  const allCycles = data?.allCycles || []
+  const latestCycle = allCycles[0] || null
+  const selectedCycle = allCycles.find(c => selectedDateStr >= c.cycle_start && selectedDateStr < c.cycle_end) || latestCycle
 
   // Shift selected date based on period and direction
   const shiftDate = (direction) => {
@@ -305,9 +186,6 @@ export default function Appliances() {
     setSelectedDateStr(`${y}-${m}-${day}`)
   }
 
-  // Find latest/current cycle in state
-  const latestCycle = useMemo(() => allCycles[0] || null, [allCycles])
-
   // Disable "next" navigation button when at maximum bounds
   const disableNext = useMemo(() => {
     if (period === 'Today') return selectedDateStr === activeDateStr
@@ -316,11 +194,6 @@ export default function Appliances() {
     if (period === 'Yearly') return selectedYear === new Date(activeDateStr + 'T00:00:00').getFullYear()
     return false
   }, [period, selectedDateStr, activeDateStr, latestCycle, selectedYear])
-
-  // Find currently selected cycle spanning selectedDateStr
-  const selectedCycle = useMemo(() => {
-    return allCycles.find(c => selectedDateStr >= c.cycle_start && selectedDateStr < c.cycle_end) || activeCycle
-  }, [selectedDateStr, allCycles, activeCycle])
 
   // Construct navigator display text (navLabel)
   const navLabel = useMemo(() => {
@@ -400,115 +273,65 @@ export default function Appliances() {
     return []
   }, [period, selectedDateStr, activeDateStr, selectedCycle, selectedYear])
 
-  // Filter readings within the selected period's date strings
-  const periodReadings = useMemo(() => {
-    return allReadings.filter(s => {
-      const sDateStr = getActiveISTDateStr(s.session_start)
-      return periodDateStrings.includes(sDateStr) && dailyCostsMap[sDateStr] !== undefined
-    })
-  }, [allReadings, periodDateStrings, dailyCostsMap])
-
-  // Calculate totals and device breakdowns
+  // Calculate totals and device breakdowns using central hook data
   const periodMetrics = useMemo(() => {
-    let totalKwh = 0
+    if (!data) return { totalKwh: 0, totalCost: 0, totalSessions: 0, devicesList: [] }
+
+    let totalKwh = data.today?.total_kwh || 0
     let totalCost = 0
-    let totalSessions = 0
+    if (period === 'Today') {
+      totalCost = data.today?.daily_cost || 0
+    } else if (period === 'Weekly') {
+      totalCost = data.today?.weekly_cost || 0
+    } else if (period === 'Yearly') {
+      totalCost = data.today?.yearly_cost || 0
+    } else {
+      totalCost = data.billing?.billing_cycle_cost || 0
+    }
+    const totalSessions = data.today?.session_count || 0
 
-    // Group device kWh
-    const deviceMeasured = {}
-    const deviceSessionsCount = {}
-    const deviceSessions = {}
-    const deviceMinutes = {}
-    const deviceDailyKwh = {}
-    
-    DEVICES_METADATA.forEach(d => {
-      deviceMeasured[d.id] = 0
-      deviceSessionsCount[d.id] = 0
-      deviceSessions[d.id] = []
-      deviceMinutes[d.id] = 0
-      deviceDailyKwh[d.id] = {}
-      periodDateStrings.forEach(dateStr => {
-        deviceDailyKwh[d.id][dateStr] = 0
-      })
-    })
-
-    periodDateStrings.forEach(dateStr => {
-      const isToday = dateStr === activeDateStr
-      
-      // Get total kWh and cost from dailyCostsMap
-      const dayData = dailyCostsMap[dateStr]
-      if (dayData) {
-        totalKwh += dayData.measured_kwh
-        totalCost += dayData.daily_cost
+    const hookDevices = data.today?.devices || []
+    const devicesList = hookDevices.map(hd => {
+      const meta = DEVICES_METADATA.find(m => m.id === hd.device_id) || {
+        brand: 'Unknown',
+        model: 'Unknown',
+        color: '#888888',
+        bg: 'var(--s2)'
       }
-
-      if (isToday) {
-        // Use appliance_readings for today
-        const daySessions = allReadings.filter(s => getActiveISTDateStr(s.session_start) === dateStr)
-        totalSessions += daySessions.length
-
-        // Group by device
-        daySessions.forEach(s => {
-          if (deviceMeasured[s.device_id] !== undefined) {
-            deviceMeasured[s.device_id] += parseFloat(s.kwh_consumed || 0)
-            deviceSessionsCount[s.device_id] += 1
-            deviceSessions[s.device_id].push(s)
-            deviceMinutes[s.device_id] += parseInt(s.duration_minutes || 0)
-            deviceDailyKwh[s.device_id][dateStr] += parseFloat(s.kwh_consumed || 0)
-          }
-        })
-      } else {
-        // Use daily_device_snapshots for past days
-        const daySnaps = deviceSnapshots.filter(s => s.snapshot_date === dateStr)
-        daySnaps.forEach(s => {
-          if (deviceMeasured[s.device_id] !== undefined) {
-            deviceMeasured[s.device_id] += parseFloat(s.measured_kwh || 0)
-            deviceSessionsCount[s.device_id] += parseInt(s.total_sessions || 0)
-            deviceMinutes[s.device_id] += parseInt(s.total_duration_minutes || 0)
-            deviceDailyKwh[s.device_id][dateStr] += parseFloat(s.measured_kwh || 0)
-            totalSessions += parseInt(s.total_sessions || 0)
-          }
-        })
-      }
-    })
-
-    // Calculate proportional costs
-    const devicesList = DEVICES_METADATA.map(meta => {
-      const kwh = deviceMeasured[meta.id]
-      const sessCount = deviceSessionsCount[meta.id]
-      const sessList = deviceSessions[meta.id]
-      const mins = deviceMinutes[meta.id]
-      const cost = totalKwh > 0 ? (kwh / totalKwh) * totalCost : 0
-      
       return {
-        ...meta,
-        kwh,
-        sessionsCount: sessCount,
-        sessions: sessList,
-        minutes: mins,
-        cost,
-        dailyKwh: deviceDailyKwh[meta.id]
+        ...hd,
+        brand: hd.brand || meta.brand,
+        model: hd.model || meta.model,
+        color: hd.color || meta.color,
+        bg: hd.bg || meta.bg,
+        sessionsCount: hd.session_count
       }
-    }).filter(d => d.kwh > 0 || d.sessionsCount > 0) // Show only active devices
-
-    // Sort by kWh descending
-    devicesList.sort((a, b) => b.kwh - a.kwh)
-
-    console.log('APPLIANCES PAGE DEVICES', devicesList)
-    console.log('APPLIANCES PAGE TOTAL', devicesList.reduce((s,d)=>s+d.kwh,0))
-    console.log('APPLIANCES SOURCE TABLE:', periodDateStrings.every(d => d === activeDateStr) ? 'appliance_readings' : 'daily_device_snapshots')
-    console.log('APPLIANCES DATE RANGE:', {
-      startDate: periodDateStrings[0],
-      endDate: periodDateStrings[periodDateStrings.length - 1]
     })
 
     return {
-      devicesList,
       totalKwh,
       totalCost,
-      totalSessions
+      totalSessions,
+      devicesList
     }
-  }, [allReadings, deviceSnapshots, periodDateStrings, dailyCostsMap, activeDateStr])
+  }, [data, period])
+
+  // Add console logs for Appliances Page
+  useEffect(() => {
+    if (!loading && data) {
+      const activeDay = getActiveDateStr()
+      const sourceUsed = selectedDateStr === activeDay ? 'live' : 'snapshot'
+      const dailySnapshot = data.dailyCosts?.find(d => d.report_date === selectedDateStr)
+      const measuredValue = dailySnapshot ? dailySnapshot.measured_kwh : 0
+      const deviceCount = data.today?.devices?.length || 0
+      console.log('Appliances Page Logs:')
+      console.log('selectedDate', selectedDateStr)
+      console.log('activeDay', activeDay)
+      console.log('sourceUsed', sourceUsed)
+      console.log('measuredValue', measuredValue)
+      console.log('deviceCount', deviceCount)
+    }
+  }, [loading, data, selectedDateStr])
 
   if (loading) {
     return (
@@ -759,7 +582,8 @@ export default function Appliances() {
 function DeviceExpansionPanel({ d, period, activeDateStr, periodDateStrings }) {
   // Calculations for Period Summary
   const avgKwhPerSession = d.sessionsCount > 0 ? d.kwh / d.sessionsCount : 0
-  const totalDuration = d.minutes || 0
+  
+  const totalDuration = d.sessions.reduce((sum, s) => sum + parseInt(s.duration_minutes || 0), 0)
   const avgDurationMins = d.sessionsCount > 0 ? totalDuration / d.sessionsCount : 0
 
   // Graph Data Construction
@@ -788,7 +612,8 @@ function DeviceExpansionPanel({ d, period, activeDateStr, periodDateStrings }) {
       // 7 Daily bins
       const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
       return periodDateStrings.map((dateStr, idx) => {
-        const kwh = d.dailyKwh ? (d.dailyKwh[dateStr] || 0) : 0
+        const daySessions = d.sessions.filter(s => getActiveISTDateStr(s.session_start) === dateStr)
+        const kwh = daySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
         return {
           label: DAY_LABELS[idx],
           kwh
@@ -799,9 +624,13 @@ function DeviceExpansionPanel({ d, period, activeDateStr, periodDateStrings }) {
     if (period === 'Billing Cycle') {
       // Daily bins for the cycle dates
       return periodDateStrings.map(dateStr => {
-        const kwh = d.dailyKwh ? (d.dailyKwh[dateStr] || 0) : 0
+        const daySessions = d.sessions.filter(s => getActiveISTDateStr(s.session_start) === dateStr)
+        const kwh = daySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
+        
+        // Short label format: "28 May"
         const dObj = new Date(dateStr + 'T00:00:00')
         const label = dObj.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+        
         return {
           label,
           kwh
@@ -812,25 +641,24 @@ function DeviceExpansionPanel({ d, period, activeDateStr, periodDateStrings }) {
     if (period === 'Yearly') {
       // 12 Monthly bins
       const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-      const monthlyKwh = Array(12).fill(0)
-
-      periodDateStrings.forEach(dateStr => {
-        const kwh = d.dailyKwh ? (d.dailyKwh[dateStr] || 0) : 0
-        const dObj = new Date(dateStr + 'T00:00:00')
-        const monthIdx = dObj.getMonth()
-        monthlyKwh[monthIdx] += kwh
-      })
-
+      const activeYear = new Date(activeDateStr + 'T00:00:00').getFullYear()
+      
       return MONTH_LABELS.map((monthName, idx) => {
+        const monthlySessions = d.sessions.filter(s => {
+          const startTime = new Date(s.session_start)
+          const istTime = new Date(startTime.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
+          return istTime.getFullYear() === activeYear && istTime.getMonth() === idx
+        })
+        const kwh = monthlySessions.reduce((sum, s) => sum + parseFloat(s.kwh_consumed || 0), 0)
         return {
           label: monthName,
-          kwh: monthlyKwh[idx]
+          kwh
         }
       })
     }
 
     return []
-  }, [d.sessions, d.dailyKwh, period, periodDateStrings, activeDateStr])
+  }, [d.sessions, period, periodDateStrings, activeDateStr])
 
   const formatTime = (isoStr) => {
     if (!isoStr) return 'Running'

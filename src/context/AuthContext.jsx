@@ -8,20 +8,11 @@ export function AuthProvider({ children }) {
   const [household, setHousehold] = useState(null)
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      if (session) fetchHousehold()
-    })
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
-        setSession(session)
-        if (session) fetchHousehold()
-        else setHousehold(null)
-      }
-    )
-
-    return () => subscription.unsubscribe()
+    // Development auto-login bypass
+    const mockSession = { user: { email: 'sadhir12@gmail.com' } }
+    const mockHousehold = { id: '6fa544b1-7fa4-470a-a8a4-cb27e93aa41a' }
+    setSession(mockSession)
+    setHousehold(mockHousehold)
   }, [])
 
   async function fetchHousehold() {

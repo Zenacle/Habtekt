@@ -159,6 +159,17 @@ function getActiveISTDateStr(isoStr) {
   return toLocalISO(istDate);
 }
 
+// Helper: Get active IST day for the current instant
+function getActiveISTDay() {
+  const now = new Date();
+  const istTimeMs = now.getTime() + (5.5 * 60 * 60 * 1000);
+  const adjustedDate = new Date(istTimeMs - (6 * 60 * 60 * 1000));
+  const y = adjustedDate.getUTCFullYear();
+  const m = String(adjustedDate.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(adjustedDate.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 // Helper: Get dates in range inclusive
 function getDatesInRange(startStr, endStr) {
   const dates = [];
@@ -244,7 +255,7 @@ async function runBackfill() {
   console.log(`Fetched ${readings.length} total appliance readings.`);
 
   console.log('\nFetching devices table...');
-  const { data: devices, error: devicesErr } = await supabase
+  let { data: devices, error: devicesErr } = await supabase
     .from('devices')
     .select(`
       id,
@@ -254,13 +265,52 @@ async function runBackfill() {
       room
     `);
 
+  const STATIC_DEVICES = [
+    {
+      id: 'ea0b66d3-0d00-4a70-8b87-cab8908d9e38',
+      device_name: 'AC - 1st Floor',
+      device_type: 'ac',
+      floor: '1st Floor',
+      room: 'Bedroom'
+    },
+    {
+      id: 'a2814a9c-b2ca-4607-9ce9-acf311548440',
+      device_name: 'Heater - GF',
+      device_type: 'geyser',
+      floor: 'Ground Floor',
+      room: 'Bathroom'
+    },
+    {
+      id: '3b896f6f-0e7f-44ff-acd3-33d82ef11aa7',
+      device_name: 'AC - GF',
+      device_type: 'ac',
+      floor: 'Ground Floor',
+      room: 'Living Room'
+    },
+    {
+      id: 'ff320fc1-0cbd-4af4-9dcc-98711ce67bde',
+      device_name: 'Water Pump',
+      device_type: 'pump',
+      floor: 'Ground Floor',
+      room: 'Utility'
+    },
+    {
+      id: '2ec92fd0-d62f-49a2-86e9-a5dafbb5bc6a',
+      device_name: 'Heater - 1st Floor',
+      device_type: 'geyser',
+      floor: '1st Floor',
+      room: 'Bathroom'
+    }
+  ];
+
   if (devicesErr) {
-    console.error('Failed to fetch devices:', devicesErr.message);
-    process.exit(1);
+    console.warn('Warning: Failed to fetch devices from DB:', devicesErr.message, '. Falling back to static devices map.');
+    devices = STATIC_DEVICES;
   }
   const deviceMap = new Map(
     devices.map(d => [d.id, d])
   );
+
 
   if (readings.length === 0) {
     console.log('No readings found to backfill.');
@@ -360,7 +410,7 @@ async function runBackfill() {
       readingsByDayAndDevice[day][r.device_id] += parseFloat(r.kwh_consumed || 0);
     }
 
-    const todayStr = toLocalISO(new Date());
+    const activeISTDayStr = getActiveISTDay();
     const energySnapshots = [];
     const deviceSnapshots = [];
     const comparisonLogs = [];
@@ -368,14 +418,16 @@ async function runBackfill() {
     // Calculate snapshots cycle-by-cycle to compute progressive cumulative costs correctly
     for (const cycle of cyclesToProcess) {
       let lastDateStr;
-      if (cycle.end <= todayStr) {
+      if (cycle.end <= activeISTDayStr) {
         // Cycle has ended. Generate up to cycle.end - 1 day
         const endDate = new Date(cycle.end + 'T00:00:00Z');
         endDate.setUTCDate(endDate.getUTCDate() - 1);
         lastDateStr = endDate.toISOString().slice(0, 10);
       } else {
-        // Cycle is ongoing. Generate up to todayStr
-        lastDateStr = todayStr;
+        // Cycle is ongoing. Generate up to the day BEFORE activeISTDayStr (so we never generate snapshot for current active day)
+        const activeDate = new Date(activeISTDayStr + 'T00:00:00Z');
+        activeDate.setUTCDate(activeDate.getUTCDate() - 1);
+        lastDateStr = activeDate.toISOString().slice(0, 10);
       }
       const cycleDates = getDatesInRange(cycle.start, lastDateStr);
       
@@ -432,6 +484,17 @@ async function runBackfill() {
           (sum, s) => sum + (s.duration_minutes || 0),
           0
         );
+
+        // Guardrail: Ensure snapshot cannot be written with measured_kwh = 0 while source readings exist
+        const totalSourceKwh = daySessions.reduce(
+          (sum, s) => sum + parseFloat(s.kwh_consumed || 0),
+          0
+        );
+        if (day.totalMeasuredKwh === 0 && totalSourceKwh > 0) {
+          const errorMsg = `[ERROR] Data Integrity Violation: Snapshot for ${dateStr} has measured_kwh = 0, but ${daySessions.length} source readings exist in appliance_readings with total kWh = ${totalSourceKwh}!`;
+          console.error(errorMsg);
+          throw new Error(errorMsg);
+        }
 
         // 2. Generate Period Start and Period End (Timezone safe UTC shift)
         const periodStart = `${dateStr}T00:30:00.000Z`;
