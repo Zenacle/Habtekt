@@ -135,17 +135,27 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
     setError(null)
 
     try {
+      // ── 0. Wait for Supabase session to initialize (prevent race condition on first load) ──
+      const { data: { session: activeSession }, error: sessionError } = await supabase.auth.getSession()
+      console.log('[DEBUG] Supabase auth session initialization check:', { hasSession: !!activeSession, sessionError })
+
       // ── 1. Compute active date (respects 6 AM IST boundary) ──────────────
       const currentDateStr = selectedDate ?? getActiveDateStr()
       const activeDayStr = getActiveDateStr()
       const isToday = currentDateStr === activeDayStr
 
       // ── 2. Get billing cycles for the household first ───────────────────
-      const { data: cycles } = await supabase
+      const { data: cycles, error: cyclesErr } = await supabase
         .from('billing_cycle_summary')
         .select('*')
         .eq('household_id', householdId)
         .order('cycle_start', { ascending: false })
+
+      if (cyclesErr) {
+        console.error('[ERROR] billing_cycle_summary query encountered error:', cyclesErr)
+      } else {
+        console.log('[DEBUG] billing_cycle_summary query count:', cycles?.length || 0)
+      }
 
       const allCycles = cycles || []
       let activeCycle = allCycles.find(c => currentDateStr >= c.cycle_start && currentDateStr < c.cycle_end) || null
@@ -153,13 +163,17 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const isExpired = activeCycle && currentDateStr >= activeCycle.cycle_end
 
       if (isExpired || !activeCycle) {
-        const { data: latestCycle } = await supabase
+        const { data: latestCycle, error: latestCycleErr } = await supabase
           .from('billing_cycle_summary')
           .select('*')
           .eq('household_id', householdId)
           .order('cycle_end', { ascending: false })
           .limit(1)
           .maybeSingle()
+
+        if (latestCycleErr) {
+          console.error('[ERROR] latest billing_cycle_summary query encountered error:', latestCycleErr)
+        }
 
         let currentStart, currentEnd
         if (latestCycle) {
@@ -180,13 +194,17 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           currentEnd = dates.cycleEnd
         }
 
-        const { data: existingCycle } = await supabase
+        const { data: existingCycle, error: existingCycleErr } = await supabase
           .from('billing_cycle_summary')
           .select('*')
           .eq('household_id', householdId)
           .eq('cycle_start', currentStart)
           .eq('cycle_end', currentEnd)
           .maybeSingle()
+
+        if (existingCycleErr) {
+          console.error('[ERROR] existing billing_cycle_summary query encountered error:', existingCycleErr)
+        }
 
         if (existingCycle) {
           activeCycle = existingCycle
@@ -211,8 +229,9 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
 
           if (!insertError && inserted) {
             activeCycle = inserted
+            console.log('[DEBUG] billing_cycle_summary inserted new cycle:', inserted)
           } else {
-            console.error("Failed to insert new cycle:", insertError)
+            console.error("[ERROR] Failed to insert new cycle:", insertError)
             activeCycle = { ...newCycle, id: 'temp-new-cycle' }
           }
         }
@@ -329,8 +348,29 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           .select('id, device_name, device_type, floor, room')
       ])
 
+      // Detailed Logging for all queries
+      console.log('[DEBUG] devices query result:', { data: devicesResult?.data, error: devicesResult?.error })
+      console.log('[DEBUG] appliance_readings queries results:', {
+        todayReadingsCount: todayReadingsResult?.data?.length,
+        todayReadingsError: todayReadingsResult?.error,
+        allLastCompletedCount: allLastCompletedResult?.data?.length,
+        allLastCompletedError: allLastCompletedResult?.error,
+        allOpenSessionsCount: allOpenSessionsResult?.data?.length,
+        allOpenSessionsError: allOpenSessionsResult?.error,
+        readingsForMetaCount: readingsForMetaResult?.data?.length,
+        readingsForMetaError: readingsForMetaResult?.error
+      })
+      console.log('[DEBUG] daily_energy_snapshots query result:', { dataCount: energySnapshotsResult?.data?.length, error: energySnapshotsResult?.error })
+      console.log('[DEBUG] daily_device_snapshots query result:', { dataCount: deviceSnapshotsResult?.data?.length, error: deviceSnapshotsResult?.error })
+      console.log('[DEBUG] daily_reports queries results:', {
+        todayReport: todayReportResult?.data,
+        todayReportError: todayReportResult?.error,
+        weeklyHistoryCount: weeklyHistoryResult?.data?.length,
+        weeklyHistoryError: weeklyHistoryResult?.error
+      })
+
       // ── 5. Build device-name map ──────────────────────────────────────────
-      const devicesList = devicesResult.data || []
+      const devicesList = devicesResult?.data || []
       const devicesById = {}
 
       const STATIC_DEVICES_MAP = {
@@ -376,13 +416,15 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       })
 
       devicesList.forEach(d => {
-        devicesById[d.id] = d
+        if (d && d.id) {
+          devicesById[d.id] = d
+        }
       })
 
       const deviceNameMap = {}
-      const readingsForMeta = readingsForMetaResult.data || []
+      const readingsForMeta = readingsForMetaResult?.data || []
       readingsForMeta.forEach(r => {
-        if (r.device_id && !deviceNameMap[r.device_id]) {
+        if (r && r.device_id && !deviceNameMap[r.device_id]) {
           const dbDevice = devicesById[r.device_id]
           deviceNameMap[r.device_id] = {
             name: dbDevice?.device_name || dbDevice?.name || r.device_id,
@@ -391,10 +433,12 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         }
       })
       devicesList.forEach(d => {
-        if (!deviceNameMap[d.id]) {
-          deviceNameMap[d.id] = {
-            name: d.device_name || d.name || d.id,
-            type: d.device_type || 'others'
+        if (d && d.id) {
+          if (!deviceNameMap[d.id]) {
+            deviceNameMap[d.id] = {
+              name: d.device_name || d.name || d.id,
+              type: d.device_type || 'others'
+            }
           }
         }
       })
@@ -407,8 +451,8 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
         }
       })
 
-      const energySnapshots = energySnapshotsResult.data || []
-      const deviceSnapshots = deviceSnapshotsResult.data || []
+      const energySnapshots = energySnapshotsResult?.data || []
+      const deviceSnapshots = deviceSnapshotsResult?.data || []
 
       // ── 6. Live Calculations for today ───────────────────────────
       let todayMeasuredKwh = 0
@@ -421,15 +465,15 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       let todayLiveEnergySnapshot = null
 
       if (isToday) {
-        const todayReadings = todayReadingsResult.data || []
+        const todayReadings = todayReadingsResult?.data || []
         todayMeasuredKwh = todayReadings.reduce((sum, r) => sum + parseFloat(r.kwh_consumed || 0), 0)
-        const coverageRatio = todayReportResult.data?.coverage_ratio ?? 0.6
+        const coverageRatio = todayReportResult?.data?.coverage_ratio ?? 0.6
         todayEstimatedKwh = coverageRatio > 0 ? todayMeasuredKwh / coverageRatio : todayMeasuredKwh
         todaySessionsCount = todayReadings.length
         todayDuration = todayReadings.reduce((sum, r) => sum + parseInt(r.duration_minutes || 0), 0)
 
         const pastCycleSnapshots = energySnapshots.filter(
-          s => s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date < currentDateStr
+          s => s && s.snapshot_date >= activeCycle.cycle_start && s.snapshot_date < currentDateStr
         )
         const prevCumulativeEstimated = pastCycleSnapshots.reduce(
           (sum, s) => sum + parseFloat(s.estimated_kwh || 0),
@@ -440,11 +484,13 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
 
         const readingsByDevice = {}
         todayReadings.forEach(r => {
-          const id = r.device_id
-          if (!readingsByDevice[id]) {
-            readingsByDevice[id] = []
+          if (r && r.device_id) {
+            const id = r.device_id
+            if (!readingsByDevice[id]) {
+              readingsByDevice[id] = []
+            }
+            readingsByDevice[id].push(r)
           }
-          readingsByDevice[id].push(r)
         })
 
         todayLiveDeviceSnapshots = Object.entries(readingsByDevice).map(([deviceId, devReadings]) => {
@@ -453,7 +499,7 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           const devDuration = devReadings.reduce((sum, r) => sum + parseInt(r.duration_minutes || 0), 0)
 
           const device = devicesById[deviceId] || { id: deviceId, device_name: undefined }
-          const displayName = device.device_name || device.name || 'Unknown Device'
+          const displayName = device.device_name || device.name || deviceId
 
           const info = deviceNameMap[deviceId] || {}
           const meta = DEVICE_METADATA_MAP[deviceId] || {}
@@ -694,12 +740,20 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       hasMoreDevices = devices.length > 3
 
       const allLastCompleted = {}
-      if (allLastCompletedResult.data) {
-        allLastCompletedResult.data.forEach(s => { if (!allLastCompleted[s.device_id]) allLastCompleted[s.device_id] = s })
+      if (allLastCompletedResult?.data) {
+        allLastCompletedResult.data.forEach(s => { 
+          if (s && s.device_id && !allLastCompleted[s.device_id]) {
+            allLastCompleted[s.device_id] = s 
+          }
+        })
       }
       const allOpenSessions = {}
-      if (allOpenSessionsResult.data) {
-        allOpenSessionsResult.data.forEach(s => { if (!allOpenSessions[s.device_id]) allOpenSessions[s.device_id] = s })
+      if (allOpenSessionsResult?.data) {
+        allOpenSessionsResult.data.forEach(s => { 
+          if (s && s.device_id && !allOpenSessions[s.device_id]) {
+            allOpenSessions[s.device_id] = s 
+          }
+        })
       }
 
       devices.forEach(d => {

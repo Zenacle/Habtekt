@@ -150,7 +150,7 @@ export default function Energy() {
   const [viewMode, setViewMode] = useState('Daily')
   const [selectedDateStr, setSelectedDateStr] = useState(activeDateStr)
 
-  const { data, loading, error } = useHomeData(household?.id, viewMode, selectedDateStr)
+  const { data, loading, error, refetch } = useHomeData(household?.id, viewMode, selectedDateStr)
 
   const selectedDate = useMemo(() => new Date(selectedDateStr), [selectedDateStr])
 
@@ -431,6 +431,67 @@ export default function Energy() {
         : getDailyBadge(_cycleDailyAvg)
 
   console.log('ENERGY PAGE DEVICES', dailyDevices);
+
+  // Handle initial loading state
+  if (loading && !data) {
+    return (
+      <div className="min-h-screen bg-[#F2EFE9] pb-24">
+        {/* Render header structure first to keep navigation feeling smooth */}
+        <div className="energy-header">
+          <div>
+            <h1>Energy usage</h1>
+            <p>Loading your home's energy details...</p>
+          </div>
+        </div>
+        
+        {/* Skeleton loaders matching page layout */}
+        <div className="px-4 pt-4 space-y-4">
+          <div className="bg-white rounded-2xl p-6 border border-black/5 shadow-sm animate-pulse space-y-3">
+            <div className="h-4 bg-gray-200 rounded w-1/3"></div>
+            <div className="h-8 bg-gray-200 rounded w-1/2"></div>
+            <div className="h-4 bg-gray-200 rounded w-1/4"></div>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white rounded-xl p-4 border border-black/5 shadow-sm animate-pulse h-24"></div>
+            <div className="bg-white rounded-xl p-4 border border-black/5 shadow-sm animate-pulse h-24"></div>
+            <div className="bg-white rounded-xl p-4 border border-black/5 shadow-sm animate-pulse h-24"></div>
+            <div className="bg-white rounded-xl p-4 border border-black/5 shadow-sm animate-pulse h-24"></div>
+          </div>
+
+          <div className="bg-white rounded-2xl p-6 border border-black/5 shadow-sm animate-pulse h-48"></div>
+        </div>
+        <BottomNav />
+      </div>
+    )
+  }
+
+  // Handle fatal load error state
+  if (error && !data) {
+    return (
+      <div className="min-h-screen bg-[#F2EFE9] flex flex-col items-center justify-center p-6 pb-24">
+        <div className="bg-white p-6 rounded-2xl border border-black/5 shadow-sm max-w-sm w-full text-center">
+          <div className="w-12 h-12 bg-red-50 text-red-500 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+          </div>
+          <h3 className="text-base font-bold text-[#1A1916] mb-2">Failed to load energy data</h3>
+          <p className="text-xs text-[#6B6860] mb-6">{error.message || 'An error occurred while fetching data from Supabase.'}</p>
+          <button 
+            onClick={() => refetch()}
+            className="w-full bg-[#1A1916] text-white hover:bg-black/90 font-semibold py-2.5 px-4 rounded-xl text-sm transition-all"
+          >
+            Retry
+          </button>
+        </div>
+        <BottomNav />
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-[var(--bg)] pb-24">
       <style>{`

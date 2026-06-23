@@ -1,7 +1,13 @@
 {
+  "crons": [
+    {
+      "path": "/api/generate-snapshots",
+      "schedule": "30 0 * * *"
+    }
+  ],
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/((?!api/).*)",
       "destination": "/index.html"
     }
   ]
