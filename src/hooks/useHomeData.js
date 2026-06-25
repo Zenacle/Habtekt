@@ -160,9 +160,8 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
       const allCycles = cycles || []
       let activeCycle = allCycles.find(c => currentDateStr >= c.cycle_start && currentDateStr < c.cycle_end) || null
 
-      const isExpired = activeCycle && currentDateStr >= activeCycle.cycle_end
-
-      if (isExpired || !activeCycle) {
+      if (!activeCycle) {
+        console.log('[DEBUG] No active billing cycle found in database for current date. Calculating local fallback cycle in memory.');
         const { data: latestCycle, error: latestCycleErr } = await supabase
           .from('billing_cycle_summary')
           .select('*')
@@ -194,46 +193,17 @@ export function useHomeData(householdId, viewMode = 'Daily', selectedDate = null
           currentEnd = dates.cycleEnd
         }
 
-        const { data: existingCycle, error: existingCycleErr } = await supabase
-          .from('billing_cycle_summary')
-          .select('*')
-          .eq('household_id', householdId)
-          .eq('cycle_start', currentStart)
-          .eq('cycle_end', currentEnd)
-          .maybeSingle()
-
-        if (existingCycleErr) {
-          console.error('[ERROR] existing billing_cycle_summary query encountered error:', existingCycleErr)
-        }
-
-        if (existingCycle) {
-          activeCycle = existingCycle
-        } else {
-          const newCycle = {
-            household_id: householdId,
-            cycle_start: currentStart,
-            cycle_end: currentEnd,
-            kwh_accumulated: 0,
-            last_reading_at: null,
-            slab_alert_threshold: 400,
-            slab_alert_sent: false,
-            cycle_locked: false,
-            source_kwh_breakdown: null
-          }
-
-          const { data: inserted, error: insertError } = await supabase
-            .from('billing_cycle_summary')
-            .insert(newCycle)
-            .select()
-            .single()
-
-          if (!insertError && inserted) {
-            activeCycle = inserted
-            console.log('[DEBUG] billing_cycle_summary inserted new cycle:', inserted)
-          } else {
-            console.error("[ERROR] Failed to insert new cycle:", insertError)
-            activeCycle = { ...newCycle, id: 'temp-new-cycle' }
-          }
+        activeCycle = {
+          id: 'temp-fallback-cycle',
+          household_id: householdId,
+          cycle_start: currentStart,
+          cycle_end: currentEnd,
+          kwh_accumulated: 0,
+          last_reading_at: null,
+          slab_alert_threshold: 400,
+          slab_alert_sent: false,
+          cycle_locked: false,
+          source_kwh_breakdown: null
         }
       }
 
