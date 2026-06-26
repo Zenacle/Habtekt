@@ -382,6 +382,86 @@ export async function generateSnapshotsForDate(targetDateStr) {
         continue;
       }
       console.log('[INFO] Billing Cycle Updated');
+
+      if (activeCycle) {
+        const cycleStart = activeCycle.cycle_start;
+        const cycleEnd = activeCycle.cycle_end;
+        const periodEnd = `${cycleEnd}T00:30:00.000Z`;
+
+        try {
+          console.log(`[INFO] Recalculating billing cycle values for household ${householdId} (existing snapshot)...`);
+          const { data: cycleSnapshots, error: cycleSnapErr } = await supabase
+            .from('daily_energy_snapshots')
+            .select('measured_kwh')
+            .eq('household_id', householdId)
+            .gte('snapshot_date', cycleStart)
+            .lt('snapshot_date', cycleEnd);
+
+          if (cycleSnapErr) {
+            console.error(`[ERROR] Failed to fetch cycle snapshots for recalculation:`, cycleSnapErr.message);
+            results.push({ householdId, status: 'error', error: cycleSnapErr.message });
+            continue;
+          }
+
+          const kwh_accumulated = (cycleSnapshots || []).reduce((sum, s) => sum + parseFloat(s.measured_kwh || 0), 0);
+
+          const { data: cycleDeviceSnapshots, error: cycleDevSnapErr } = await supabase
+            .from('daily_device_snapshots')
+            .select('device_id, measured_kwh')
+            .eq('household_id', householdId)
+            .gte('snapshot_date', cycleStart)
+            .lt('snapshot_date', cycleEnd);
+
+          if (cycleDevSnapErr) {
+            console.error(`[ERROR] Failed to fetch device snapshots for breakdown:`, cycleDevSnapErr.message);
+            results.push({ householdId, status: 'error', error: cycleDevSnapErr.message });
+            continue;
+          }
+
+          const source_kwh_breakdown = {};
+          for (const ds of cycleDeviceSnapshots || []) {
+            source_kwh_breakdown[ds.device_id] = parseFloat(((source_kwh_breakdown[ds.device_id] || 0) + parseFloat(ds.measured_kwh || 0)).toFixed(4));
+          }
+
+          const { data: latestReading, error: readErr } = await supabase
+            .from('appliance_readings')
+            .select('session_start, session_end')
+            .eq('household_id', householdId)
+            .gte('session_start', `${cycleStart}T00:30:00.000Z`)
+            .lt('session_start', periodEnd)
+            .order('session_start', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (readErr) {
+            console.warn(`[WARNING] Failed to query latest reading for last_reading_at:`, readErr.message);
+          }
+
+          const last_reading_at = latestReading ? (latestReading.session_end || latestReading.session_start) : activeCycle.last_reading_at;
+
+          console.log(`[INFO] Updating billing_cycle_summary for household ${householdId}...`);
+          const { error: updateCycleErr } = await supabase
+            .from('billing_cycle_summary')
+            .update({
+              kwh_accumulated: parseFloat(kwh_accumulated.toFixed(4)),
+              last_reading_at,
+              source_kwh_breakdown
+            })
+            .eq('id', activeCycle.id);
+
+          if (updateCycleErr) {
+            console.error(`[ERROR] Failed to update billing_cycle_summary:`, updateCycleErr.message);
+            results.push({ householdId, status: 'error', error: updateCycleErr.message });
+            continue;
+          }
+
+          console.log(`[INFO] Billing cycle summary updated successfully for household ${householdId} (existing snapshot).`);
+        } catch (recalcErr) {
+          console.error(`[ERROR] Exception during billing cycle recalculation (existing snapshot):`, recalcErr.message);
+          results.push({ householdId, status: 'error', error: recalcErr.message });
+          continue;
+        }
+      }
     } else {
       // 1. Locate or create active billing cycle
       let currentStart, currentEnd;
@@ -884,17 +964,30 @@ export async function generateSnapshotsForDate(targetDateStr) {
         const propName = householdObj.property_name || "Unknown Property";
         console.log(`[INFO]\nFetching household coordinates...\n\nHousehold:\n${propName}\n\nCoordinates:\n${lat}\n${lon}`);
         console.log(`[INFO]\nFetching weather from Open-Meteo...`);
+        console.log(`[INFO] Fetching weather...`);
         
+        let responseStatus = 'N/A';
+        const startTime = Date.now();
         try {
           const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${snapshotDate}&end_date=${snapshotDate}`;
+          console.log(`Request URL: ${url}`);
+          
           const res = await fetch(url);
+          responseStatus = res.status;
+          console.log(`HTTP status: ${res.status}`);
+          
           if (!res.ok) {
             throw new Error(`Weather API returned status ${res.status}`);
           }
           const data = await res.json();
+          console.log(`JSON parsed`);
+          
           const minTemp = data.daily?.temperature_2m_min?.[0];
           const maxTemp = data.daily?.temperature_2m_max?.[0];
           const avgTemp = minTemp !== undefined && maxTemp !== undefined ? parseFloat(((minTemp + maxTemp) / 2).toFixed(1)) : null;
+
+          const endTime = Date.now();
+          console.log(`Response time: ${endTime - startTime}ms`);
 
           if (minTemp !== undefined && maxTemp !== undefined) {
             weather_context = {
@@ -912,11 +1005,16 @@ export async function generateSnapshotsForDate(targetDateStr) {
               generated_at: new Date().toISOString()
             };
             console.log(`[INFO]\nWeather stored successfully.`);
+            console.log(`weather_context saved`);
           } else {
             throw new Error("Missing daily temperature data in API response");
           }
         } catch (err) {
           console.warn(`[WARNING]\nWeather API unavailable.\n\nScheduler continuing.`);
+          console.warn(`exact failure reason: ${err.message.includes('status') ? 'HTTP Error' : (err.message.includes('JSON') ? 'JSON Parse Error' : (err.message.includes('temperature') ? 'Missing Data Error' : 'Network/Timeout Error'))}`);
+          console.warn(`HTTP status: ${responseStatus}`);
+          console.warn(`error message: ${err.message}`);
+          console.warn(`stack: ${err.stack}`);
           weather_context = { status: "weather_api_failed" };
           weather_has_incomplete = true;
         }
@@ -1185,7 +1283,8 @@ export async function generateSnapshotsForDate(targetDateStr) {
       // Invoke Delivery Layer
       if (reportId) {
         const deliveryResult = await sendDailyReport(reportId);
-        console.log(`[INFO] Delivery Layer response:`, JSON.stringify(deliveryResult, null, 2));
+        const { message, payload, ...summary } = deliveryResult;
+        console.log(`[INFO] Delivery Layer response:`, JSON.stringify(summary, null, 2));
       }
 
       console.log(`[INFO] Snapshot created successfully for date ${snapshotDate} and household ${householdId}.`);

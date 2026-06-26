@@ -108,14 +108,77 @@ export async function sendDailyReport(reportId) {
     console.log(`[INFO] Payload Generated`);
     console.log(`[INFO] Ready For CRM Delivery`);
 
+    const crmUrl = process.env.CRM_INTEGRATION_URL || 'http://localhost:3000/api/integrations/zenacle-home';
+    const secret = process.env.CRM_INTEGRATION_SECRET;
+
+    const maxRetries = 3;
+    let attempt = 0;
+    let response = null;
+    let lastError = null;
+
+    while (attempt < maxRetries) {
+      attempt++;
+      if (attempt === 1) {
+        console.log(`[INFO] Sending report to CRM...`);
+      } else {
+        console.log(`[INFO] Sending report to CRM (Attempt ${attempt}/${maxRetries})...`);
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10-second timeout
+
+      try {
+        response = await fetch(crmUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${secret}`
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+        console.log(`[INFO] CRM responded with HTTP status ${response.status}`);
+
+        if (response.ok) {
+          console.log(`[INFO] CRM delivery successful.`);
+          return {
+            success: true,
+            reportId: report.id,
+            householdId: report.household_id,
+            recipient,
+            phone,
+            message: report.whatsapp_message,
+            payload
+          };
+        } else {
+          console.error(`[ERROR] CRM delivery failed.`);
+          // If response status is a client-side authentication/permission or bad request error, do not retry
+          if (response.status >= 400 && response.status < 500) {
+            return {
+              success: false,
+              reason: "CRM_DELIVERY_FAILED",
+              status: response.status
+            };
+          }
+          lastError = new Error(`CRM responded with status ${response.status}`);
+        }
+      } catch (error) {
+        clearTimeout(timeoutId);
+        console.error(`[ERROR] CRM delivery failed on attempt ${attempt}.`);
+        lastError = error;
+      }
+
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
     return {
-      success: true,
-      reportId: report.id,
-      householdId: report.household_id,
-      recipient,
-      phone,
-      message: report.whatsapp_message,
-      payload
+      success: false,
+      reason: lastError && lastError.name === 'AbortError' ? "CRM_TIMEOUT" : "CRM_UNAVAILABLE",
+      details: lastError ? lastError.message : "Max retries reached"
     };
 
   } catch (error) {

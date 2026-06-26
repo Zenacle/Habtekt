@@ -163,7 +163,7 @@ export default function Reports() {
         // Fetch all reports in this cycle up to selectedDate
         const { data: cycleReports } = await supabase
           .from('daily_reports')
-          .select('report_date, total_kwh, coverage_ratio')
+          .select('report_date, total_kwh, estimated_full_home_kwh, estimated_cost_inr, coverage_ratio')
           .eq('household_id', householdId)
           .gte('report_date', cycleStart)
           .lte('report_date', selectedDate)
@@ -224,11 +224,11 @@ export default function Reports() {
           let estimated = coverage > 0 ? measured / coverage : measured
 
           if (!isToday && report) {
-            if (report.daily_measured_kwh !== null && report.daily_measured_kwh !== undefined) {
-              measured = parseFloat(report.daily_measured_kwh)
+            if (report.total_kwh !== null && report.total_kwh !== undefined) {
+              measured = parseFloat(report.total_kwh)
             }
-            if (report.daily_estimated_kwh !== null && report.daily_estimated_kwh !== undefined) {
-              estimated = parseFloat(report.daily_estimated_kwh)
+            if (report.estimated_full_home_kwh !== null && report.estimated_full_home_kwh !== undefined) {
+              estimated = parseFloat(report.estimated_full_home_kwh)
             }
           }
 
@@ -236,8 +236,8 @@ export default function Reports() {
           cumulativeEstimated += estimated
           
           let cost = calculateTNEBBill(cumulativeEstimated) - calculateTNEBBill(prevCumulative)
-          if (!isToday && report && report.daily_cost !== null && report.daily_cost !== undefined) {
-            cost = parseFloat(report.daily_cost)
+          if (!isToday && report && report.estimated_cost_inr !== null && report.estimated_cost_inr !== undefined) {
+            cost = parseFloat(report.estimated_cost_inr)
           }
 
           sumDailyCosts += cost
