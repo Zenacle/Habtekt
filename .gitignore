@@ -25,4 +25,6 @@ dist-ssr
 
 # Scratch scripts and temporary audit folders
 scratch/
+scratch_*.mjs
+.env
 

@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "snapshot": "node run_daily_snapshot.js",
+    "snapshot:backfill": "node run_daily_snapshot.js auto"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

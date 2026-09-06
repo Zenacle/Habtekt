@@ -14,17 +14,29 @@ const getClient = () => {
 
 /**
  * Reads a daily report, resolves recipient contact info, performs pre-CRM validations,
- * and prepares the payload for CRM delivery.
+ * sends the payload to CRM, and updates daily_reports.delivery_status & delivered_at accordingly.
  *
  * @param {string} reportId The UUID of the daily report row
- * @returns {Promise<Object>} Structured delivery response with prepared payload or validation failure details
+ * @returns {Promise<Object>} Structured delivery response with payload or error details
  */
 export async function sendDailyReport(reportId) {
-  console.log(`[INFO] Preparing Delivery`);
+  console.log(`[INFO] [CRM_DELIVERY] Starting delivery for Report ID: ${reportId}`);
+  const supabase = getClient();
+
+  const markFailed = async (reason, details, httpStatus = null) => {
+    console.error(`[ERROR] [CRM_DELIVERY] Report ID: ${reportId} | HTTP Status: ${httpStatus || 'N/A'} | CRM Result: Failed (${reason}) | DB Status Update: failed | Details: ${details || 'None'}`);
+    try {
+      await supabase
+        .from('daily_reports')
+        .update({ delivery_status: 'failed' })
+        .eq('id', reportId);
+    } catch (dbErr) {
+      console.error(`[ERROR] [CRM_DELIVERY] Failed to update delivery_status to failed for report ${reportId}: ${dbErr.message}`);
+    }
+    return { success: false, reason, details, status: httpStatus };
+  };
 
   try {
-    const supabase = getClient();
-
     // 1. Fetch and validate report
     const { data: report, error: reportErr } = await supabase
       .from('daily_reports')
@@ -33,21 +45,24 @@ export async function sendDailyReport(reportId) {
       .maybeSingle();
 
     if (reportErr) {
-      console.warn(`[WARNING] Database error fetching report ${reportId}: ${reportErr.message}`);
-      return { success: false, reason: "DATABASE_ERROR", details: reportErr.message };
+      return await markFailed("DATABASE_ERROR", reportErr.message);
     }
     if (!report) {
-      console.warn(`[WARNING] Report delivery failed: Report ${reportId} not found.`);
-      return { success: false, reason: "REPORT_MISSING" };
+      return await markFailed("REPORT_MISSING", `Report ${reportId} not found`);
     }
 
-    // 2. Validate WhatsApp message exists
+    // 2. Retry Safety: If already delivered, skip dispatch to avoid duplicate messages
+    if (report.delivery_status === 'delivered') {
+      console.log(`[INFO] [CRM_DELIVERY] Report ID: ${reportId} already marked as delivered at ${report.delivered_at}. Skipping CRM dispatch.`);
+      return { success: true, reportId: report.id, alreadyDelivered: true, status: 200 };
+    }
+
+    // 3. Validate WhatsApp message exists
     if (!report.whatsapp_message || !report.whatsapp_message.trim()) {
-      console.warn(`[WARNING] Report delivery failed: WhatsApp message content missing in report ${reportId}.`);
-      return { success: false, reason: "WHATSAPP_MESSAGE_MISSING" };
+      return await markFailed("WHATSAPP_MESSAGE_MISSING", `WhatsApp message content missing in report ${reportId}`);
     }
 
-    // 3. Fetch and validate household
+    // 4. Fetch and validate household
     const { data: household, error: householdErr } = await supabase
       .from('households')
       .select('id, owner_id, property_name')
@@ -55,18 +70,15 @@ export async function sendDailyReport(reportId) {
       .maybeSingle();
 
     if (householdErr) {
-      console.warn(`[WARNING] Database error fetching household ${report.household_id}: ${householdErr.message}`);
-      return { success: false, reason: "DATABASE_ERROR", details: householdErr.message };
+      return await markFailed("DATABASE_ERROR", householdErr.message);
     }
     if (!household) {
-      console.warn(`[WARNING] Report delivery failed: Household ${report.household_id} not found.`);
-      return { success: false, reason: "HOUSEHOLD_MISSING" };
+      return await markFailed("HOUSEHOLD_MISSING", `Household ${report.household_id} not found`);
     }
 
-    // 4. Fetch and validate owner
+    // 5. Fetch and validate owner
     if (!household.owner_id) {
-      console.warn(`[WARNING] Report delivery failed: Owner ID missing on household ${household.id}.`);
-      return { success: false, reason: "OWNER_MISSING" };
+      return await markFailed("OWNER_MISSING", `Owner ID missing on household ${household.id}`);
     }
 
     const { data: ownerUser, error: userErr } = await supabase
@@ -76,25 +88,21 @@ export async function sendDailyReport(reportId) {
       .maybeSingle();
 
     if (userErr) {
-      console.warn(`[WARNING] Database error fetching owner ${household.owner_id}: ${userErr.message}`);
-      return { success: false, reason: "DATABASE_ERROR", details: userErr.message };
+      return await markFailed("DATABASE_ERROR", userErr.message);
     }
     if (!ownerUser) {
-      console.warn(`[WARNING] Report delivery failed: Owner details not found for household ${household.id}.`);
-      return { success: false, reason: "OWNER_MISSING" };
+      return await markFailed("OWNER_MISSING", `Owner details not found for household ${household.id}`);
     }
 
-    // 5. Validate phone number exists
+    // 6. Validate phone number exists
     if (!ownerUser.phone || !ownerUser.phone.trim()) {
-      console.warn(`[WARNING] Report delivery failed: Phone number missing for owner ${ownerUser.id}.`);
-      return { success: false, reason: "PHONE_NUMBER_MISSING" };
+      return await markFailed("PHONE_NUMBER_MISSING", `Phone number missing for owner ${ownerUser.id}`);
     }
 
     const recipient = ownerUser.full_name || 'Zenacle User';
     const phone = ownerUser.phone.trim();
-    console.log(`[INFO] Recipient Resolved`);
 
-    // 6. Build frozen CRM payload
+    // 7. Build frozen CRM payload
     const payload = {
       report_id: report.id,
       household_id: report.household_id,
@@ -105,8 +113,6 @@ export async function sendDailyReport(reportId) {
       delivery_type: "daily_energy_report",
       source: "zenacle_home"
     };
-    console.log(`[INFO] Payload Generated`);
-    console.log(`[INFO] Ready For CRM Delivery`);
 
     const crmUrl = process.env.CRM_INTEGRATION_URL || 'http://localhost:3000/api/integrations/zenacle-home';
     const secret = process.env.CRM_INTEGRATION_SECRET;
@@ -118,14 +124,10 @@ export async function sendDailyReport(reportId) {
 
     while (attempt < maxRetries) {
       attempt++;
-      if (attempt === 1) {
-        console.log(`[INFO] Sending report to CRM...`);
-      } else {
-        console.log(`[INFO] Sending report to CRM (Attempt ${attempt}/${maxRetries})...`);
-      }
+      console.log(`[INFO] [CRM_DELIVERY] Sending report ${reportId} to CRM (Attempt ${attempt}/${maxRetries})...`);
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10-second timeout
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
 
       try {
         response = await fetch(crmUrl, {
@@ -139,34 +141,45 @@ export async function sendDailyReport(reportId) {
         });
 
         clearTimeout(timeoutId);
-        console.log(`[INFO] CRM responded with HTTP status ${response.status}`);
 
         if (response.ok) {
-          console.log(`[INFO] CRM delivery successful.`);
+          const deliveredAt = new Date().toISOString();
+          console.log(`[INFO] [CRM_DELIVERY] Report ID: ${reportId} | HTTP Status: ${response.status} | CRM Result: Success | Updating DB status to delivered...`);
+          
+          const { error: updateErr } = await supabase
+            .from('daily_reports')
+            .update({
+              delivery_status: 'delivered',
+              delivered_at: deliveredAt
+            })
+            .eq('id', report.id);
+
+          if (updateErr) {
+            console.error(`[ERROR] [CRM_DELIVERY] Report ID: ${reportId} | HTTP Status: ${response.status} | DB Status Update Failed: ${updateErr.message}`);
+          } else {
+            console.log(`[INFO] [CRM_DELIVERY] Report ID: ${reportId} | DB Status Update: delivered (at ${deliveredAt})`);
+          }
+
           return {
             success: true,
             reportId: report.id,
             householdId: report.household_id,
             recipient,
             phone,
-            message: report.whatsapp_message,
+            status: response.status,
+            deliveredAt,
             payload
           };
         } else {
-          console.error(`[ERROR] CRM delivery failed.`);
-          // If response status is a client-side authentication/permission or bad request error, do not retry
+          console.error(`[ERROR] [CRM_DELIVERY] Report ID: ${reportId} | HTTP Status: ${response.status} | CRM POST failed.`);
           if (response.status >= 400 && response.status < 500) {
-            return {
-              success: false,
-              reason: "CRM_DELIVERY_FAILED",
-              status: response.status
-            };
+            return await markFailed("CRM_DELIVERY_FAILED", `CRM responded with HTTP status ${response.status}`, response.status);
           }
-          lastError = new Error(`CRM responded with status ${response.status}`);
+          lastError = new Error(`CRM responded with HTTP status ${response.status}`);
         }
       } catch (error) {
         clearTimeout(timeoutId);
-        console.error(`[ERROR] CRM delivery failed on attempt ${attempt}.`);
+        console.error(`[ERROR] [CRM_DELIVERY] Report ID: ${reportId} | Attempt ${attempt} failed: ${error.message}`);
         lastError = error;
       }
 
@@ -175,18 +188,10 @@ export async function sendDailyReport(reportId) {
       }
     }
 
-    return {
-      success: false,
-      reason: lastError && lastError.name === 'AbortError' ? "CRM_TIMEOUT" : "CRM_UNAVAILABLE",
-      details: lastError ? lastError.message : "Max retries reached"
-    };
+    const reason = lastError && lastError.name === 'AbortError' ? "CRM_TIMEOUT" : "CRM_UNAVAILABLE";
+    return await markFailed(reason, lastError ? lastError.message : "Max retries reached", response?.status || null);
 
   } catch (error) {
-    console.error(`[ERROR] Delivery Layer exception for report ${reportId}:`, error.message);
-    return {
-      success: false,
-      reason: "UNEXPECTED_EXCEPTION",
-      details: error.message
-    };
+    return await markFailed("UNEXPECTED_EXCEPTION", error.message);
   }
 }

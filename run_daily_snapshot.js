@@ -1,10 +1,18 @@
 import './loadEnv.js';
 import { generateSnapshotsForDate } from './src/utils/snapshotGenerator.js';
 
-// Extract optional date from arguments (e.g. node run_daily_snapshot.js 2026-06-23)
-const dateArg = process.argv.slice(2).find(arg => /^\d{4}-\d{2}-\d{2}$/.test(arg));
+// Extract optional date or date range from CLI arguments
+const dateArgs = process.argv.slice(2).filter(arg => /^\d{4}-\d{2}-\d{2}$/.test(arg));
 
-generateSnapshotsForDate(dateArg)
+let targetArg = 'auto';
+
+if (dateArgs.length === 1) {
+  targetArg = dateArgs[0];
+} else if (dateArgs.length >= 2) {
+  targetArg = { startDate: dateArgs[0], endDate: dateArgs[1] };
+}
+
+generateSnapshotsForDate(targetArg)
   .then((results) => {
     console.log(JSON.stringify(results, null, 2));
     process.exit(0);
